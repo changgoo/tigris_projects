@@ -40,9 +40,10 @@ MeshBlock and deposit only into active cells on each receiver. This preserves th
 pre-cooling physics order and lets the existing post-cooling boundary communication
 synchronize updated active zones.
 
-`TaskList::DoTaskListOneStage` runs each task independently per MeshBlock. Rank-level
-exchange work must therefore happen outside the task list, through explicit mesh-level
-calls from `main.cpp` between split operator-split passes.
+`TaskList::DoTaskListOneStage` runs each task independently per MeshBlock. Therefore
+new communication phases should be normal per-MeshBlock P2P task-list tasks, following
+the existing particle/hydro boundary communication pattern. Do not put collectives or
+rank-wide aggregation inside those tasks.
 
 ---
 
@@ -102,23 +103,19 @@ left unsupported for `r_return == 0` in the first implementation.
 ## Required task-flow target
 
 Mass return must become coherent operator-split work, not a `USERWORK` side effect.
-The target ordering uses split per-MeshBlock task-list passes plus mesh-level exchange
-calls:
+The target ordering stays inside the per-MeshBlock operator-split task list:
 
 ```
-OperatorSplitTaskListPhase1()
-  -> INTERACT_PRE_MR
-pmesh->AccretionDeltaExchange()
-OperatorSplitTaskListPhase2()
-  -> ACCRETION_DELTA_APPLY -> FEEDBACK_INJECT
-  -> MASS_RETURN_COLLECT_LOCAL -> MASS_RETURN_DEPOSIT_ACTIVE
-pmesh->MassReturnCommitExchange()
-OperatorSplitTaskListPhase3()
-  -> MASS_RETURN_COMMIT_APPLY -> OPS_INT_COOLING
+INTERACT_PRE_MR
+  -> SEND/RECV_ACCDELTA -> ACCRETION_DELTA_APPLY
+  -> FEEDBACK_INJECT
+  -> SEND/RECV_MR_RECORDS -> MASS_RETURN_DEPOSIT_ACTIVE
+  -> SEND/RECV_MR_TOTALS -> MASS_RETURN_COMMIT_APPLY
+  -> OPS_INT_COOLING
 ```
 
 The exact task names can follow Athena++ conventions, but the ownership split is fixed:
-rank-level exchanges run outside `TaskList`; deposit/apply tasks run per MeshBlock.
+all these exchange/deposit/apply steps are per-MeshBlock tasks and contain no collectives.
 
 `Particles::ProcessNewParticles(pmesh, ipar)` is already a mesh-level operation: it
 counts `pid == NEW` particles on every local MeshBlock, all-reduces counts indexed by
@@ -221,5 +218,5 @@ Currently does NOT record which neighbor the ghost came from — this is the key
    mesh-level barrier that makes `pid == NEW` unique after operator-split physics.
 6. For `r_return > 0`, do not depend on fresh mass-return ghost zones. Deposit active
    zones on all affected MeshBlocks and rely on the existing post-cooling boundary sync.
-7. Do not implement rank-level exchange as a normal task-list task; split the
-   operator-split list and call rank-level exchange from `main.cpp`.
+7. Implement accretion-delta and mass-return exchanges as per-MeshBlock P2P task-list
+   tasks, not rank-level collectives.

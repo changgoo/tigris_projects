@@ -25,9 +25,8 @@ restores the concrete rev-2 implementation details needed for coding.
 
 | File | Change |
 |------|--------|
-| `src/main.cpp` | Split operator-split execution into task-list passes with mesh-level exchange calls between passes |
-| `src/task_list/ops_task_list.hpp` | Add task IDs and declarations for per-MeshBlock split phases |
-| `src/task_list/ops_task_list.cpp` | Register per-MeshBlock phases for each operator-split pass |
+| `src/task_list/ops_task_list.hpp` | Add task IDs and declarations for per-MeshBlock P2P exchange phases |
+| `src/task_list/ops_task_list.cpp` | Register per-MeshBlock exchange/deposit/commit tasks before cooling |
 | `src/particles/particles.hpp` | Add origin arrays, tag constants, and rank exchange/mailbox declarations |
 | `src/particles/particles_bvals.cpp` | Preserve origin fields and record source rank/gid on ghost flush |
 | `src/particles/complex_particles.hpp/cpp` | Split accretion from delta exchange/apply; capture ghost origins at push time |
@@ -48,31 +47,24 @@ total returned to the particle owner. The existing post-cooling hydro/scalar bou
 communication then synchronizes the updated active zones before `CONS2PRIM`.
 
 ```text
-// main.cpp, once per cycle after RK stages and ray tracing:
-OperatorSplitTaskListPhase1()
-  CREATE_PAR -> SET_FBR -> SEND/RECV_GPAR[SH] -> INTERACT_PRE_MR
-
-pmesh->AccretionDeltaExchange()
-  RankExchangeManager::Exchange(PAR_DELTA_CHANNEL)
-
-OperatorSplitTaskListPhase2()
-  ACCRETION_DELTA_APPLY -> FEEDBACK_INJECT
-  -> MASS_RETURN_COLLECT_LOCAL -> MASS_RETURN_DEPOSIT_ACTIVE
-
-pmesh->MassReturnCommitExchange()
-  aggregate deposited totals from all local MeshBlocks
-  RankExchangeManager::Exchange(PAR_MR_COMMIT_CHANNEL)
-
-OperatorSplitTaskListPhase3()
-  MASS_RETURN_COMMIT_APPLY
+CREATE_PAR -> SET_FBR -> SEND/RECV_GPAR[SH]
+  -> INTERACT_PRE_MR
+  -> SEND_ACCDELTA / RECV_ACCDELTA
+  -> ACCRETION_DELTA_APPLY
+  -> FEEDBACK_INJECT
+  -> SEND_MR_RECORDS / RECV_MR_RECORDS
+  -> MASS_RETURN_DEPOSIT_ACTIVE
+  -> SEND_MR_TOTALS / RECV_MR_TOTALS
+  -> MASS_RETURN_COMMIT_APPLY
   -> OPS_INT_COOLING
   -> existing SEND/RECV/SETB_HYD and SEND/RECV/SETB_SCLR tasks
   -> REMOVE_PAR -> CONS2PRIM -> PHY_BVAL -> USERWORK -> CLEAR_ALLBND
 ```
 
-`TaskList::DoTaskListOneStage` executes tasks independently per MeshBlock, so rank-level
-exchange phases are not task-list tasks. They are mesh-level calls from `main.cpp`,
-matching existing patterns such as FFT gravity solves and `Particles::ProcessNewParticles`.
+`TaskList::DoTaskListOneStage` executes tasks independently per MeshBlock. Therefore
+the new communication phases must be per-MeshBlock P2P tasks, like existing particle
+and hydro boundary tasks. They must not contain collectives and must not wait for "all
+local MeshBlocks" to reach the same point.
 
 Do not place mass return after the existing post-cooling communication to reuse that
 sync point. That would move particle mass return after cooling and would either change
@@ -89,13 +81,16 @@ return when it complicates the first PR.
 | Step | Ownership | Depends On | Action |
 |------|-----------|------------|--------|
 | `INTERACT_PRE_MR` | per MeshBlock | `recvgpar` | `Merge()` then `AccreteLocal()`; accretion writes local/ghost cells and records ghost deltas, but does not exchange/apply them |
-| `AccretionDeltaExchange()` | mesh/rank-level outside task list | Phase 1 complete | pack ghost deltas from all local blocks; route to owner rank/gid |
-| `ACCRETION_DELTA_APPLY` | per MeshBlock, Phase 2 | exchange complete | apply delivered deltas to active particles using existing pid/position/shear matching |
+| `SEND_ACCDELTA` | per MeshBlock | `INTERACT_PRE_MR` | pack this block's ghost deltas into neighbor/owner buffers and send counts/payloads |
+| `RECV_ACCDELTA` | per MeshBlock | matching receives posted/arrived | receive delta counts/payloads addressed to this block |
+| `ACCRETION_DELTA_APPLY` | per MeshBlock | `RECV_ACCDELTA` | apply delivered deltas to active particles using existing pid/position/shear matching |
 | `FEEDBACK_INJECT` | per MeshBlock | delta apply | current `pmf->DoFeedback(pmy_block, this)` unchanged |
-| `MASS_RETURN_COLLECT_LOCAL` | per MeshBlock, Phase 2 | feedback inject | stage eligible `r_return > 0` records for affected blocks |
-| `MASS_RETURN_DEPOSIT_ACTIVE` | per MeshBlock, Phase 2 | collect local complete | deposit active zones only and stage deposited totals |
-| `MassReturnCommitExchange()` | mesh/rank-level outside task list | Phase 2 complete | aggregate deposited totals and exchange owner-directed totals |
-| `MASS_RETURN_COMMIT_APPLY` | per MeshBlock, Phase 3 | commit exchange complete | owner blocks subtract returned totals from active particles |
+| `SEND_MR_RECORDS` | per MeshBlock | feedback inject | send eligible `r_return > 0` records to affected neighbor-stencil blocks |
+| `RECV_MR_RECORDS` | per MeshBlock | matching receives posted/arrived | receive finite-radius mass-return records addressed to this block |
+| `MASS_RETURN_DEPOSIT_ACTIVE` | per MeshBlock | `RECV_MR_RECORDS` | deposit active zones only and stage deposited totals |
+| `SEND_MR_TOTALS` | per MeshBlock | deposit active | send deposited totals back to owner blocks |
+| `RECV_MR_TOTALS` | per MeshBlock | matching receives posted/arrived | receive deposited totals for local active particles |
+| `MASS_RETURN_COMMIT_APPLY` | per MeshBlock | `RECV_MR_TOTALS` | owner blocks subtract returned totals from active particles |
 
 Apply accretion deltas before feedback so particle masses and flags are final for any
 feedback logic that inspects particle state.
@@ -190,35 +185,27 @@ if (r_return > max_supported_exchange_distance)
 where `max_supported_exchange_distance` is derived from physical block extents and the
 actual neighbor stencil. Do not express this as a raw cell-count comparison.
 
-## Exchange Manager Design
+## Per-MeshBlock Exchange Design
 
-Use Option A: a Mesh-level `RankExchangeManager` owned by `Mesh` or the particle
-subsystem and reused by `ComplexParticles` and `MassReturn`. It owns phase-local remote
-send buffers and a same-rank mailbox:
+Use per-MeshBlock flat buffers modeled after existing particle boundary buffers, not a
+rank-level exchange manager. Each channel has send/receive buffers indexed by
+`pbval_->neighbor[i].bufid` and uses tags derived from destination lid, destination
+buffer id, particle type, and a high-bit channel namespace.
 
-```cpp
-using MailboxKey = std::pair<int, int>;  // (dst_gid, channel)
-std::map<MailboxKey, std::vector<Real>> local_mailbox_;
-```
-
-Required interface:
+Required operations per channel:
 
 ```cpp
-void BeginPhase(int channel, int entry_size);
-void Post(int dst_rank, int dst_gid, int channel, const Real* data, int n);
-void Exchange(int channel);  // count exchange then payload exchange for remote ranks
-void Drain(int my_gid, int channel, std::vector<Real>& out);
-void EndPhase(int channel);
+void ClearChannelBuffers(int channel);
+void PackToNeighbor(int bufid, const Real* data, int n);
+void SendChannel(int channel);     // send counts then payloads to each neighbor
+bool ReceiveChannel(int channel);  // receive counts/payloads; true when complete
 ```
 
-`Post` appends directly to `local_mailbox_` when `dst_rank == Globals::my_rank`; remote
-records are grouped by destination rank/gid/channel and sent once per phase. `Drain`
-returns all records for `(my_gid, channel)` and clears that mailbox entry. The mailbox
-is cleared at `BeginPhase`.
-
-Parallelization assumption for PR 1: flat MPI. No OpenMP locking is required. Each
-MeshBlock can still stage outgoing records in its own vectors during per-MeshBlock
-tasks; the mesh-level exchange call merges those vectors before MPI exchange.
+Same-rank neighboring MeshBlocks are still real communication partners. In flat MPI,
+the first implementation may use the same MPI send/receive path and tags as cross-rank
+neighbors. If MPI loopback proves fragile, add a small local mailbox keyed by
+`(dst_gid, channel)` inside the per-MeshBlock channel implementation, but do not promote
+the exchange to a rank-level task.
 
 ## Accretion Delta Return
 
@@ -266,8 +253,9 @@ records must have `pid >= 0`.
 
 ### `MASS_RETURN_COMMIT`
 
-For `r_return > 0`, aggregate local deposited totals and return them to owner rank/gid
-with the rank exchange manager.
+For `r_return > 0`, each depositing MeshBlock sends deposited totals back to the owner
+MeshBlock with the per-MeshBlock `SEND_MR_TOTALS`/`RECV_MR_TOTALS` channel. The owner
+block applies all totals addressed to its active particles in `MASS_RETURN_COMMIT_APPLY`.
 
 If `r_return == 0` is kept, use one vector `MPI_Allreduce`, not one reduction per
 particle. Build a deterministic list of collected `pid >= 0` values during
@@ -297,23 +285,23 @@ all-direction wrapping.
 
 ## Implementation Sequence
 
-1. Split operator-split execution in `main.cpp` into the three passes above.
-2. Add per-MeshBlock task IDs/functions in `ops_task_list.hpp/cpp` for each pass.
-3. Add `RankExchangeManager` and safe tag assertions.
-4. Add/preserve origin fields and `FlushReceiveBuffer` source arguments.
-5. Split `ComplexParticles::InteractWithMesh()` into pre-MR accretion, delta exchange,
+1. Add per-MeshBlock task IDs/functions in `ops_task_list.hpp/cpp` for the exchange,
+   deposit, and commit tasks above.
+2. Add per-MeshBlock channel buffers and safe tag assertions.
+3. Add/preserve origin fields and `FlushReceiveBuffer` source arguments.
+4. Split `ComplexParticles::InteractWithMesh()` into pre-MR accretion, delta exchange,
    delta apply, and feedback injection.
-6. Convert accretion-delta return to owner-routed exchange.
-7. Split mass return into collect/deposit/commit and exclude `pid < 0`; make finite-
+5. Convert accretion-delta return to owner-routed per-MeshBlock exchange.
+6. Split mass return into collect/deposit/commit and exclude `pid < 0`; make finite-
    radius deposit active-zone-only.
-8. Implement `r_return > 0` neighbor-stencil physical-overlap routing with a physical
+7. Implement `r_return > 0` neighbor-stencil physical-overlap routing with a physical
    radius guard for deferred multi-hop routing.
-9. Either implement `r_return == 0` as a once-per-rank vector reduction or add a clear
+8. Either implement `r_return == 0` as a once-per-rank vector reduction or add a clear
    runtime guard that defers global return.
-10. Keep non-uniform MeshBlocks/rank support if it falls out naturally; otherwise document
+9. Keep non-uniform MeshBlocks/rank support if it falls out naturally; otherwise document
    the uniform-ownership assumption and open a follow-up.
-11. Remove the `USERWORK` mass-return hook.
-12. Run verification below.
+10. Remove the `USERWORK` mass-return hook.
+11. Run verification below.
 
 ## Verification
 

@@ -120,7 +120,7 @@ desirable follow-up if it does not fall out naturally.
 | `review.md` | First review of the original P2P plan |
 | `review_taskflow.md` | Second review focused on task flow, multi-MeshBlock/rank, and boundary compatibility |
 | `review_final.md` | Review of rev 3: five gaps identified (task flow, exchange manager, REFRESH_MR_GHOSTS, INTERACT split, r_return==0 form) |
-| `review_rev4.md` | Review of rev 4 (current plan): prior gaps closed; one blocking issue (rank-level tasks) and two secondary items remain |
+| `review_rev4.md` | Review of rev 4: caught task-list ownership issue and neighbor-stencil scope decisions |
 | `plan_rev2_obsolete.md` | Superseded rev-2 plan kept only for historical comparison |
 | `plan_rev3_obsolete.md` | Superseded rev-3 plan kept only for historical comparison |
 
