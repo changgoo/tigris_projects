@@ -34,6 +34,12 @@ location. `USERWORK` runs after cooling, boundary updates, primitive recovery, p
 boundaries, and diagnostics. The refactor must give mass return an explicit
 operator-split task-list phase before cooling.
 
+For the prioritized `r_return > 0` path, do not add a new full hydro/scalar ghost
+refresh before mass return. Instead, route returning-particle records to every affected
+MeshBlock and deposit only into active cells on each receiver. This preserves the
+pre-cooling physics order and lets the existing post-cooling boundary communication
+synchronize updated active zones.
+
 ---
 
 ## Current code locations
@@ -97,9 +103,8 @@ The target ordering is:
 ```
 recvgpar
   -> INTERACT_PRE_MR        // merge, accretion, feedback decisions/deposits as needed
-  -> REFRESH_MR_GHOSTS      // hyd/scalar boundary refresh if mass return reads ghost zones
   -> MASS_RETURN_COLLECT    // once per rank: local inventory + P2P/global exchange
-  -> MASS_RETURN_DEPOSIT    // per MeshBlock: deposit on this block
+  -> MASS_RETURN_DEPOSIT    // per MeshBlock: deposit active zones on this block
   -> MASS_RETURN_COMMIT     // once per rank: return deposited totals to owners
   -> OPS_INT_COOLING
 ```
@@ -206,5 +211,5 @@ Currently does NOT record which neighbor the ghost came from — this is the key
 4. Preserve boundary-condition generality; do not assume all boundaries are periodic.
 5. Do not change `Particles::ProcessNewParticles` into a per-MeshBlock task; it is the
    mesh-level barrier that makes `pid == NEW` unique after operator-split physics.
-6. Before editing code, trace the task dependency that gives mass return fresh ghost
-   zones and still places it before cooling.
+6. For `r_return > 0`, do not depend on fresh mass-return ghost zones. Deposit active
+   zones on all affected MeshBlocks and rely on the existing post-cooling boundary sync.

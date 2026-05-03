@@ -35,10 +35,16 @@ restores the concrete rev-2 implementation details needed for coding.
 
 ## Final Task Graph
 
-The deposit kernels read/write hydro variables in ghost zones. `ReturnMassFromOneParticle`
-writes through `CheckInMeshBlock(..., NGHOST)`, and the global path reads ghost-zone
-density/phase when `return_to_warm` is enabled. Therefore keep a real hyd/scalar ghost
-refresh before mass-return deposit.
+For the prioritized `r_return > 0` path, do not add a mass-return hydro/scalar ghost
+refresh. The extra refresh would be equivalent to another full hydro/scalar boundary
+communication, including shear variants, and would be expensive. Instead, route each
+returning-particle record to every MeshBlock whose active domain overlaps the physical
+return sphere. Each receiving MeshBlock deposits only into its active cells.
+
+The old kernel writes through `CheckInMeshBlock(..., NGHOST)`. Refactor that behavior:
+ghost-zone deposition is replaced by owner-block active-zone deposition plus a deposited
+total returned to the particle owner. The existing post-cooling hydro/scalar boundary
+communication then synchronizes the updated active zones before `CONS2PRIM`.
 
 ```text
 recvgpar
@@ -46,20 +52,22 @@ recvgpar
   -> ACCRETION_DELTA_EXCHANGE      // once per rank
   -> ACCRETION_DELTA_APPLY         // per MeshBlock
   -> FEEDBACK_INJECT               // per MeshBlock
-  -> MR_SEND_HYD/MR_RECV_HYD/MR_SETB_HYD
-  -> MR_SEND_HYDSH/MR_RECV_HYDSH   // if shear_periodic
-  -> MR_SEND_SCLR/MR_RECV_SCLR/MR_SETB_SCLR
-  -> MR_SEND_SCLRSH/MR_RECV_SCLRSH // if NSCALARS > 0 and shear_periodic
   -> MASS_RETURN_COLLECT           // once per rank
   -> MASS_RETURN_DEPOSIT           // per MeshBlock
   -> MASS_RETURN_COMMIT            // once per rank
   -> OPS_INT_COOLING
+  -> existing SEND/RECV/SETB_HYD and SEND/RECV/SETB_SCLR tasks
 ```
 
-The refresh uses hydro and scalar boundary machinery with the same face/edge/corner and
-shear coverage as the post-cooling update. If `return_to_warm` depends on phase labels
-derived from primitives, refresh the fields required by `pslt->AssignPhase/CheckPhase`
-before `MASS_RETURN_DEPOSIT`.
+Do not place mass return after the existing post-cooling communication to reuse that
+sync point. That would move particle mass return after cooling and would either change
+physics ordering or require another communication before later consumers. The finite-
+radius path should run before cooling and avoid pre-MR ghost synchronization by using
+active-zone-only deposition on all affected MeshBlocks.
+
+If a later `r_return == 0` implementation needs ghost-zone density/phase information
+for global weighting, handle it separately; this is another reason to defer global
+return when it complicates the first PR.
 
 ## Task Split for `INTERACT`
 
@@ -69,7 +77,7 @@ before `MASS_RETURN_DEPOSIT`.
 | `ACCRETION_DELTA_EXCHANGE` | once per rank | all local `INTERACT_PRE_MR` complete | pack ghost deltas from all local blocks; route to owner rank/gid |
 | `ACCRETION_DELTA_APPLY` | per MeshBlock | exchange complete | apply delivered deltas to active particles using existing pid/position/shear matching |
 | `FEEDBACK_INJECT` | per MeshBlock | delta apply | current `pmf->DoFeedback(pmy_block, this)` unchanged |
-| `MASS_RETURN_*` | mixed | feedback inject + MR ghost refresh | collect/deposit/commit mass return before cooling |
+| `MASS_RETURN_*` | mixed | feedback inject | collect/deposit/commit finite-radius mass return before cooling; deposit active zones only |
 
 Apply accretion deltas before feedback so particle masses and flags are final for any
 feedback logic that inspects particle state.
@@ -222,9 +230,10 @@ an explicit diagnostic skip.
 ### `MASS_RETURN_DEPOSIT`
 
 Each MeshBlock deposits from its delivered records. The first implementation should focus
-on `ReturnMassFromOneParticle` for `r_return > 0`. Reuse `ReturnMassFromOneParticleGlobal`
-only if global return remains supported. Receiving blocks still filter geometrically.
-Each block records deposited totals:
+on an active-zone-only variant of `ReturnMassFromOneParticle` for `r_return > 0`.
+Receiving blocks still filter geometrically, but they must not write to ghost zones.
+Reuse `ReturnMassFromOneParticleGlobal` only if global return remains supported. Each
+block records deposited totals:
 
 ```text
 [owner_rank, owner_gid, pid, xp, yp, zp, deposited_mass_or_vars...]
@@ -272,7 +281,8 @@ all-direction wrapping.
 4. Split `ComplexParticles::InteractWithMesh()` into pre-MR accretion, delta exchange,
    delta apply, and feedback injection.
 5. Convert accretion-delta return to owner-routed exchange.
-6. Split mass return into collect/deposit/commit and exclude `pid < 0`.
+6. Split mass return into collect/deposit/commit and exclude `pid < 0`; make finite-
+   radius deposit active-zone-only.
 7. Implement `r_return > 0` physical-overlap routing across all affected MeshBlocks.
 8. Either implement `r_return == 0` as a once-per-rank vector reduction or add a clear
    runtime guard that defers global return.
