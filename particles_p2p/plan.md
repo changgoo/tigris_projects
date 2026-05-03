@@ -1,441 +1,208 @@
-# P2P Ghost Return Refactor — Implementation Plan (rev 2)
+# P2P Ghost Return Refactor — Implementation Plan (rev 3)
 
-*Updated after advisor review. Changes from rev 1 are marked ★.*
+This plan supersedes `plan_rev2_obsolete.md`. The main change is task-flow ownership:
+mass return must be an operator-split physics phase, not a `USERWORK` workaround, and
+all communication phases must support multiple MeshBlocks per rank.
+
+## Design rules
+
+1. Do not put mass-return physics in `USERWORK`.
+2. Do not call MPI collectives or neighbor exchanges from independent per-MeshBlock loops.
+3. Collect/exchange/commit phases run once per rank; deposit phases run per MeshBlock.
+4. Same-rank neighboring MeshBlocks communicate through an explicit local mailbox or
+   rank-level exchange manager, never by writing into the sender object's receive vector.
+5. Boundary routing must use existing neighbor lists, block IDs, ranks, buffer IDs, and
+   shear/boundary transforms. Do not assume all directions are periodic.
+6. `pid=NEW` matching remains position-aware and shear-aware.
 
 ## Files changed
 
 | File | Change |
 |------|--------|
-| `src/particles/particles.hpp` | Add `origin_rank_`, `origin_gid_` (sentinel −1); `DeltaBuffer` struct; `delta_send_/recv_`; declare `InitDeltaBuffers()` |
-| `src/particles/particles_bvals.cpp` | `FlushReceiveBuffer`: record origin on ghost flush; `InitDeltaBuffers()`: allocate + tag delta buffers with `PAR_DELTA_TAG_BIT` |
-| `src/particles/complex_particles.hpp` | ★ Add `ghost_accretion_origin_rank_/gid_`; declare updated `ExchangeGhostAccretionDelta()` |
-| `src/particles/complex_particles.cpp` | ★ Populate origin arrays in `Accrete()`; replace `ExchangeGhostAccretionDelta()` body |
-| `src/particles/mass_return.hpp` | Declare `CollectParticlesInfo()`; ★ split `ReturnMassFromParticles()` into collect + deposit |
-| `src/particles/mass_return.cpp` | Replace Allgatherv for `r_return > 0`; ★ fix `r_return == 0` call structure |
-| `src/particles/particles.hpp` (tags) | ★ Add `PAR_DELTA_TAG_BIT`, `PAR_MR_TAG_BIT` constants |
-| `src/pgen/tigress_classic.cpp` | ★ Move `CollectParticlesInfo` for `r_return == 0` from `MeshBlock::UserWorkInLoop` to `Mesh::UserWorkInLoop` |
+| `src/task_list/` operator-split task list | Add explicit mass-return collect/deposit/commit hooks before cooling |
+| `src/particles/particles.hpp` | Add ghost origin arrays; declare rank-level exchange/mailbox helpers; define tag namespaces |
+| `src/particles/particles_bvals.cpp` | Record ghost origins during receive flush; initialize safe channel tags |
+| `src/particles/complex_particles.hpp/cpp` | Capture ghost-accretion origins at push time; replace delta Allgatherv with owner-routed return |
+| `src/particles/mass_return.hpp/cpp` | Split mass return into collect, exchange, deposit, and commit phases |
+| `src/pgen/tigress_classic.cpp` | Remove temporary `USERWORK` mass-return hook after task-list hook exists |
 
----
+## Target operator-split flow
 
-## Step 1 — Track origin on ghost particles
+Mass return needs fresh ghost-zone information but must still run before cooling. Add a
+named phase inside `OperatorSplitTaskList`:
 
-### particles.hpp
-
-Add alongside `pid`, `flag` in the `Particles` class:
-
-```cpp
-AthenaArray<int> origin_rank_;  // rank of active copy; -1 for active particles
-AthenaArray<int> origin_gid_;   // global block ID of active copy; -1 for active particles
+```text
+recvgpar
+  -> INTERACT_PRE_MR        // merge, accretion, feedback decisions/deposits as needed
+  -> REFRESH_MR_GHOSTS      // hyd/scalar boundary refresh if mass return reads ghost zones
+  -> MASS_RETURN_COLLECT    // once per rank: all local MeshBlocks contribute records
+  -> MASS_RETURN_DEPOSIT    // per MeshBlock: deposit using exchanged particle records
+  -> MASS_RETURN_COMMIT     // once per rank: return deposited totals to particle owners
+  -> OPS_INT_COOLING
 ```
 
-★ Initialize to `−1` in `UpdateCapacity()` for all newly allocated slots so a stray
-read on an active particle traps rather than uses garbage.
+`REFRESH_MR_GHOSTS` can reuse existing hydro/scalar boundary communication machinery,
+but it must be a real task dependency. This replaces the temporary reason for calling
+mass return from `USERWORK`.
 
-### particles_bvals.cpp — FlushReceiveBuffer (line 629)
+## Step 1 — Ghost origin tracking for accretion deltas
 
-Change signature:
+Add to `Particles`:
+
 ```cpp
-void Particles::FlushReceiveBuffer(ParticleBuffer& recv, bool ghost,
-                                   int src_rank = -1, int src_gid = -1)
+AthenaArray<int> origin_rank_;  // active-copy rank; -1 for active/local particles
+AthenaArray<int> origin_gid_;   // active-copy gid; -1 for active/local particles
 ```
 
-After the existing copy loop:
-```cpp
-if (ghost && src_rank >= 0) {
-  for (int k = npartot; k < npartot + nprecv; ++k) {
-    origin_rank_(k) = src_rank;
-    origin_gid_(k)  = src_gid;
-  }
-}
-```
+Initialize new capacity to `-1`. Preserve these fields through particle append,
+compaction, deletion swaps, migration receives, and ghost receives. In
+`FlushReceiveBuffer`, when `ghost == true`, set origins from the source
+`NeighborBlock` or `SimpleNeighborBlock`.
 
-Update two call sites:
-- `ReceiveFromNeighbors` (line 517): pass `nb.snb.rank, nb.snb.gid`
-- Shearing-periodic receive (line 1112): pass `snb.rank, snb.gid`
-  ★ `SimpleNeighborBlock` has both `rank` and `gid` fields — this works directly.
-  Add a comment at that call site to prevent future removal.
-
----
-
-## Step 2 — ★ Fix index tracking for accretion deltas (was blocking bug)
-
-The old plan read `origin_gid_(npar_ + g)` to find the origin of the g-th ghost
-accretion entry. This is wrong: `g` indexes `ghost_accretion_pids_` (only accreting
-ghosts), not the ghost particle storage array.
-
-**Fix**: capture origin at push time in `Accrete()`.
-
-### complex_particles.hpp — add parallel arrays
+In `ComplexParticles`, add:
 
 ```cpp
-// alongside ghost_accretion_pids_, ghost_accretion_xp_, etc.:
 std::vector<int> ghost_accretion_origin_rank_;
 std::vector<int> ghost_accretion_origin_gid_;
 ```
 
-### complex_particles.cpp — AccreteFromSingleParticle() / Accrete()
+When a ghost particle at storage index `k` pushes a ghost-accretion delta, push
+`origin_rank_(k)` and `origin_gid_(k)` at the same time. Clear these vectors only after
+the exchange has packed/applied the entries.
 
-Where the existing code pushes to `ghost_accretion_pids_[g]` for ghost particle at
-storage index `k`, add:
+## Step 2 — Safe communication channels
 
-```cpp
-ghost_accretion_origin_rank_.push_back(origin_rank_(k));
-ghost_accretion_origin_gid_.push_back(origin_gid_(k));
-```
-
-Clear both arrays alongside the others at the start of `ExchangeGhostAccretionDelta()`.
-
----
-
-## Step 3 — ★ Fixed delta buffer infrastructure (tag collision fix)
-
-### Tag constants — particles.hpp
+Use channel offsets above the existing particle-buffer tag range:
 
 ```cpp
-// High-bit flags that clear the (lid<<11 | bufid<<5 | ipar<<2) range.
-// MPI_TAG_UB >= 32767 guaranteed; MPICH/OpenMPI provide >= 2^23-1.
-constexpr int PAR_DELTA_TAG_BIT = 1 << 20;  // accretion delta return channel
-constexpr int PAR_MR_TAG_BIT    = 1 << 21;  // mass-return neighbor channel
+constexpr int PAR_DELTA_TAG_BIT = 1 << 20;
+constexpr int PAR_MR_TAG_BIT    = 1 << 21;
 ```
 
-Add a startup assertion in `Particles::InitParticleBvals()`:
-```cpp
-#ifdef MPI_PARALLEL
-int tag_ub, flag;
-MPI_Attr_get(MPI_COMM_WORLD, MPI_TAG_UB, &tag_ub, &flag);
-if (!flag || tag_ub < (PAR_MR_TAG_BIT | (1<<12)))
-  ATHENA_ERROR("MPI_TAG_UB too small for P2P delta tags");
-#endif
-```
-
-### DeltaBuffer struct — particles.hpp (Particles protected section)
+At initialization, compute the maximum possible base tag from local lid/bufid/ipar
+usage and assert:
 
 ```cpp
-struct DeltaBuffer {
-  std::vector<Real> data;      // flat: [entry_size * nentries]
-  std::vector<Real> recv_data;
-  int nentries   = 0;
-  int nrecv      = 0;
-  int entry_size = 0;
-  int tag        = -1;   // base send/recv tag for this channel (uses +0 count, +1 data)
-  int src_rank   = -1;
-
-  void Clear() { nentries = 0; data.clear(); }
-  void Append(const Real* entry) {
-    data.insert(data.end(), entry, entry + entry_size);
-    ++nentries;
-  }
-};
-std::vector<DeltaBuffer> delta_send_;   // indexed by nb.bufid
-std::vector<DeltaBuffer> delta_recv_;
+base_tag < PAR_DELTA_TAG_BIT
+PAR_MR_TAG_BIT + base_tag + 1 <= MPI_TAG_UB
 ```
 
-### InitDeltaBuffers() — particles_bvals.cpp
+Do not rely on `ipar + MAX_PARTICLE_TYPES`; those bits overlap the existing `bufid`
+field.
 
-```cpp
-void Particles::InitDeltaBuffers(int entry_size, int tag_bit) {
-  const int n = pbval_->nneighbor;
-  delta_send_.assign(n, DeltaBuffer{});
-  delta_recv_.assign(n, DeltaBuffer{});
+## Step 3 — Rank-level exchange manager
 
-  for (int i = 0; i < n; ++i) {
-    NeighborBlock& nb   = pbval_->neighbor[i];
-    SimpleNeighborBlock& snb = nb.snb;
+Create a small exchange helper for flat `Real` records. It should support:
 
-    delta_send_[i].entry_size = entry_size;
-    delta_send_[i].src_rank   = snb.rank;
-    // ★ tag_bit places tags far above the existing (lid<<11|bufid<<5|ipar<<2) range
-    delta_send_[i].tag = tag_bit | (snb.lid<<11) | (nb.targetid<<5) | (ipar_<<2);
+- remote sends/receives by `(dst_rank, dst_gid, channel)`,
+- same-rank delivery through a mailbox keyed by destination gid and channel,
+- count exchange followed by payload exchange,
+- separate channels for accretion deltas, mass-return particle records, and deposited totals.
 
-    delta_recv_[i].entry_size = entry_size;
-    delta_recv_[i].src_rank   = snb.rank;
-    delta_recv_[i].tag = tag_bit | (pmy_block->lid<<11) | (nb.bufid<<5) | (ipar_<<2);
-  }
-}
+The helper can still use `pbval_->neighbor` for local block adjacency, but ownership is
+rank-level: one rank posts one coherent exchange per phase, after all local MeshBlocks
+have contributed their outgoing records.
+
+## Step 4 — Replace `ExchangeGhostAccretionDelta()`
+
+Packing remains per `ComplexParticles` object, but sending is deferred to the
+rank-level accretion-delta exchange phase.
+
+Record layout stays:
+
+```text
+[pid, xp, yp, zp, delta[0..NHYDRO+NSCALARS-1]]
 ```
 
-Call from `ComplexParticles` constructor:
-```cpp
-InitDeltaBuffers(4 + NHYDRO + NSCALARS, PAR_DELTA_TAG_BIT);
+For each ghost-accretion entry, route to `ghost_accretion_origin_rank_[g]` and
+`ghost_accretion_origin_gid_[g]`. The destination block applies entries with the
+existing pid/position matching logic. For `pid=NEW`, keep the shear-periodic unwrapping
+and half-cell tolerance.
+
+Do not silently drop a delta whose origin block is not in the local neighbor list.
+That is an error unless the particle was already deleted by a documented path.
+
+## Step 5 — Refactor mass return into collect/deposit/commit
+
+### `MASS_RETURN_COLLECT` — once per rank
+
+Each local MeshBlock contributes active, non-ghost particles due for mass return.
+Then:
+
+- `r_return > 0`: send records only to ranks/blocks whose domains may overlap the
+  return region, using boundary-aware geometry and existing neighbor metadata.
+- `r_return == 0`: use a global collective once per rank, because every rank genuinely
+  needs every returning particle.
+
+For local return, assert the physical return radius cannot reach beyond the exchange
+stencil. This must be based on physical block extents/cell widths, not only raw cell
+counts, unless `r_return` is confirmed to be cell units.
+
+### `MASS_RETURN_DEPOSIT` — per MeshBlock
+
+Each MeshBlock deposits from the records delivered to it. The geometric deposit kernel
+may reuse `ReturnMassFromOneParticle()` and `ReturnMassFromOneParticleGlobal()`, but
+the input list is now pre-collected. Receiving blocks must still filter geometrically
+before deposit.
+
+Each block records deposited totals per owner particle:
+
+```text
+[owner_rank, owner_gid, pid, xp, yp, zp, deposited_mass_or_vars...]
 ```
 
-`MassReturn` will call a separate init (in the `MassReturn` constructor) with `PAR_MR_TAG_BIT`.
+The position fields are required for `pid=NEW` disambiguation.
 
----
+### `MASS_RETURN_COMMIT` — once per rank
 
-## Step 4 — Replace ExchangeGhostAccretionDelta()
+Aggregate deposited totals across all local MeshBlocks, then return totals to particle
+owners. Use owner-directed P2P for `r_return > 0`. For `r_return == 0`, a once-per-rank
+global reduction is acceptable. The owner subtracts exactly the deposited total from
+the active particle.
 
-```cpp
-void ComplexParticles::ExchangeGhostAccretionDelta() {
-  const int nvar = NHYDRO + NSCALARS;
-  const int entry_size = 4 + nvar;
+No `MPI_Allreduce(total_mass_return, ...)` may remain inside a per-MeshBlock method.
 
-  // --- Pack: group deltas by origin neighbor (★ use origin arrays, not storage index) ---
-  for (int i = 0; i < pbval_->nneighbor; ++i)
-    delta_send_[i].Clear();
+## Step 6 — Boundary-condition handling
 
-  for (int g = 0; g < (int)ghost_accretion_pids_.size(); ++g) {
-    int org_gid  = ghost_accretion_origin_gid_[g];   // ★ captured at accretion time
-    int org_rank = ghost_accretion_origin_rank_[g];
-    int bufid = -1;
-    for (int i = 0; i < pbval_->nneighbor; ++i) {
-      if (pbval_->neighbor[i].snb.gid == org_gid) { bufid = i; break; }
-    }
-    if (bufid < 0) continue;
+All routing and matching must support:
 
-    Real entry[entry_size];
-    entry[0] = static_cast<Real>(ghost_accretion_pids_[g]);
-    entry[1] = ghost_accretion_xp_[g];
-    entry[2] = ghost_accretion_yp_[g];
-    entry[3] = ghost_accretion_zp_[g];
-    for (int v = 0; v < nvar; ++v)
-      entry[4 + v] = ghost_accretion_deltas_[g](v);
-    delta_send_[bufid].Append(entry);
-  }
+- shear-periodic x/y boundaries,
+- disk/outflow/open z boundaries,
+- combined shear plus vertical boundary cases,
+- same-rank and cross-rank neighbors,
+- non-uniform MeshBlocks per rank.
 
-#ifdef MPI_PARALLEL
-  std::vector<int> send_counts(pbval_->nneighbor, 0);
-  std::vector<int> recv_counts(pbval_->nneighbor, 0);
-  std::vector<MPI_Request> reqs;
+Use existing boundary infrastructure for image positions and neighbor identity. Avoid
+manual "wrap every coordinate periodically" logic. For outflow/open/disk boundaries,
+only route to actual MeshBlocks that can receive deposited mass; do not create phantom
+periodic partners.
 
-  for (int i = 0; i < pbval_->nneighbor; ++i) {
-    int dst = delta_send_[i].src_rank;
-    send_counts[i] = delta_send_[i].nentries;
+## Step 7 — Remove temporary hook
 
-    // ★ same-rank: direct copy (avoids deadlock, no MPI loopback needed)
-    if (dst == Globals::my_rank) {
-      int recv_bufid = pbval_->neighbor[i].targetid;
-      delta_recv_[recv_bufid].recv_data = delta_send_[i].data;
-      delta_recv_[recv_bufid].nrecv     = delta_send_[i].nentries;
-      continue;
-    }
-    MPI_Request rq;
-    MPI_Isend(&send_counts[i], 1, MPI_INT, dst,
-              delta_send_[i].tag, my_comm, &rq);  reqs.push_back(rq);
-    MPI_Irecv(&recv_counts[i], 1, MPI_INT, dst,
-              delta_recv_[i].tag, my_comm, &rq);  reqs.push_back(rq);
-  }
-  MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
-  reqs.clear();
-
-  for (int i = 0; i < pbval_->nneighbor; ++i) {
-    int dst = delta_send_[i].src_rank;
-    if (dst == Globals::my_rank) continue;
-
-    if (send_counts[i] > 0) {
-      MPI_Request rq;
-      MPI_Isend(delta_send_[i].data.data(), send_counts[i] * entry_size,
-                MPI_ATHENA_REAL, dst, delta_send_[i].tag + 1, my_comm, &rq);
-      reqs.push_back(rq);
-    }
-    if (recv_counts[i] > 0) {
-      delta_recv_[i].recv_data.resize(recv_counts[i] * entry_size);
-      delta_recv_[i].nrecv = recv_counts[i];
-      MPI_Request rq;
-      MPI_Irecv(delta_recv_[i].recv_data.data(), recv_counts[i] * entry_size,
-                MPI_ATHENA_REAL, dst, delta_recv_[i].tag + 1, my_comm, &rq);
-      reqs.push_back(rq);
-    }
-  }
-  MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
-#else
-  for (int i = 0; i < pbval_->nneighbor; ++i) {
-    delta_recv_[i].recv_data = delta_send_[i].data;
-    delta_recv_[i].nrecv     = delta_send_[i].nentries;
-  }
-#endif
-
-  // --- Apply: unchanged matching logic, now per-neighbor buffer ---
-  RegionSize& ms = pmy_mesh_->mesh_size;
-  Real Lx = ms.x1len, Ly = ms.x2len, Lz = ms.x3len;
-  Real tol = 0.5 * pmy_block->pcoord->dx1f(0);
-  Real shear_deltay = 0.0;
-  if (pmy_mesh_->shear_periodic)
-    shear_deltay = std::fmod(qomL_ * pmy_mesh_->time, Ly);
-
-  for (int i = 0; i < pbval_->nneighbor; ++i) {
-    if (delta_recv_[i].nrecv == 0) continue;
-    const Real* buf = delta_recv_[i].recv_data.data();
-    for (int e = 0; e < delta_recv_[i].nrecv; ++e) {
-      const Real* base = buf + e * entry_size;
-      // ... (identical pid/position matching + mass application from old code)
-    }
-    delta_recv_[i].nrecv = 0;
-  }
-
-  // Clear origin arrays for next cycle
-  ghost_accretion_origin_rank_.clear();
-  ghost_accretion_origin_gid_.clear();
-}
-```
-
----
-
-## Step 5 — ★ Fix r_return == 0 scope gap (was blocking constraint)
-
-**Root cause confirmed**: `ReturnMassFromParticles()` is called from
-`MeshBlock::UserWorkInLoop()` in `tigress_classic.cpp` (line 1061) — a per-MeshBlock
-task. The Allgatherv inside is called `nblocks_per_rank` times per rank. With
-non-uniform MeshBlocks this deadlocks.
-
-**Fix**: split collect from deposit. The collection (Allgatherv or P2P) runs once per
-rank; the deposit runs per MeshBlock.
-
-### mass_return.cpp — CollectParticlesInfo() returns to a Mesh-level cache
-
-```cpp
-// New: collect once per rank from Mesh::UserWorkInLoop (global return only)
-std::vector<ParticleData> MassReturn::CollectGlobalParticlesInfo();  // Allgatherv
-// Existing (now P2P only for r_return > 0): called per MeshBlock
-std::vector<ParticleData> MassReturn::CollectLocalParticlesInfo();   // neighbor P2P
-
-// ReturnMassFromParticles() now takes a pre-collected list for r_return==0:
-void MassReturn::ReturnMassFromParticles();                    // r_return > 0 (as before)
-void MassReturn::ReturnMassFromParticles(                      // r_return == 0
-    const std::vector<ParticleData>& global_particles);
-```
-
-### tigress_classic.cpp — Mesh::UserWorkInLoop() (line 1215)
-
-```cpp
-void Mesh::UserWorkInLoop() {
-  // Collect mass-return info once per rank for global-return (r_return == 0) sims.
-  // This runs after all MeshBlock::UserWorkInLoop() calls complete.
-  for (int b = 0; b < nblocal; ++b) {
-    MeshBlock* pmb = my_blocks(b);
-    for (Particles* ppar : pmb->ppars) {
-      if (ComplexParticles* pspar = dynamic_cast<ComplexParticles*>(ppar)) {
-        if (pspar->mass_return && pspar->pmret->r_return == 0) {
-          // CollectGlobalParticlesInfo is a collective — called once across all blocks
-          // on all ranks by iterating only the first block (others share the result).
-          if (b == 0) global_mr_info_ = pspar->pmret->CollectGlobalParticlesInfo();
-          pspar->pmret->ReturnMassFromParticles(global_mr_info_);
-        }
-      }
-    }
-  }
-}
-```
-
-In practice, collecting on block 0 and sharing via a Mesh-level `global_mr_info_` member
-(a `std::vector<ParticleData>`) ensures the Allgatherv fires exactly once per rank per cycle.
-
-**For r_return > 0**: no change to tigress_classic.cpp. `MeshBlock::UserWorkInLoop()`
-calls `ReturnMassFromParticles()` as before; `CollectLocalParticlesInfo()` (P2P) replaces
-the Allgatherv and is safe to call per-MeshBlock.
-
-### ★ Assert r_return < block_size in MassReturn constructor
-
-```cpp
-// mass_return.cpp — MassReturn constructor
-if (r_return > 0) {
-  int min_block_cells = std::min({pmy_block->block_size.nx1,
-                                   pmy_block->block_size.nx2,
-                                   pmy_block->block_size.nx3});
-  if (r_return >= min_block_cells - 1)
-    ATHENA_ERROR("r_return exceeds MeshBlock size; P2P mass return is invalid");
-}
-```
-
----
-
-## Step 6 — Replace CollectParticlesInfo() for r_return > 0
-
-Uses the same `DeltaBuffer` infrastructure initialized with `PAR_MR_TAG_BIT`. Entry
-format matches `PackParticleData` output (flat Real array per particle).
-
-```cpp
-std::vector<ParticleData> MassReturn::CollectLocalParticlesInfo() {
-  // (existing local collection logic — unchanged)
-  std::vector<ParticleData> particles_info = CollectOwnParticles();
-
-#ifdef MPI_PARALLEL
-  std::vector<Real> send_buf;
-  PackParticleData(particles_info, send_buf);
-  int local_count = static_cast<int>(send_buf.size());
-  int n = pmy_par->pbval_->nneighbor;
-
-  // Exchange counts
-  std::vector<int> recv_counts(n, 0);
-  std::vector<MPI_Request> reqs;
-  for (int i = 0; i < n; ++i) {
-    int dst = mr_delta_send_[i].src_rank;
-    if (dst == Globals::my_rank) {
-      // same-rank: copy directly
-      int recv_bufid = pmy_par->pbval_->neighbor[i].targetid;
-      mr_delta_recv_[recv_bufid].recv_data = send_buf;
-      recv_counts[recv_bufid] = local_count;
-      continue;
-    }
-    MPI_Request rq;
-    MPI_Isend(&local_count, 1, MPI_INT, dst,
-              mr_delta_send_[i].tag, pmy_par->my_comm, &rq);  reqs.push_back(rq);
-    MPI_Irecv(&recv_counts[i], 1, MPI_INT, dst,
-              mr_delta_recv_[i].tag, pmy_par->my_comm, &rq);  reqs.push_back(rq);
-  }
-  MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
-  reqs.clear();
-
-  // Exchange data
-  for (int i = 0; i < n; ++i) {
-    int dst = mr_delta_send_[i].src_rank;
-    if (dst == Globals::my_rank) continue;
-    if (local_count > 0) {
-      MPI_Request rq;
-      MPI_Isend(send_buf.data(), local_count, MPI_ATHENA_REAL,
-                dst, mr_delta_send_[i].tag + 1, pmy_par->my_comm, &rq);
-      reqs.push_back(rq);
-    }
-    if (recv_counts[i] > 0) {
-      mr_delta_recv_[i].recv_data.resize(recv_counts[i]);
-      MPI_Request rq;
-      MPI_Irecv(mr_delta_recv_[i].recv_data.data(), recv_counts[i], MPI_ATHENA_REAL,
-                dst, mr_delta_recv_[i].tag + 1, pmy_par->my_comm, &rq);
-      reqs.push_back(rq);
-    }
-  }
-  MPI_Waitall(reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
-
-  // Unpack
-  for (int i = 0; i < n; ++i) {
-    if (recv_counts[i] > 0)
-      UnpackParticleData(mr_delta_recv_[i].recv_data, particles_info);
-  }
-#endif
-
-  return particles_info;
-}
-```
-
----
+After the task-list mass-return phase is working, remove the temporary
+`Mesh::UserWorkInLoop()` or `MeshBlock::UserWorkInLoop()` mass-return call. `USERWORK`
+should return to diagnostics/history/output work only.
 
 ## Implementation sequence
 
-1. Add `ghost_accretion_origin_rank_/gid_`; populate in `Accrete()` (fixes index bug).
-2. Add `PAR_DELTA_TAG_BIT`/`PAR_MR_TAG_BIT` constants + `MPI_TAG_UB` assertion (fixes tag bug).
-3. Add `origin_rank_/origin_gid_` with sentinel −1; update `FlushReceiveBuffer`.
-4. Implement `InitDeltaBuffers()`; call from constructors.
-5. Implement `ExchangeGhostAccretionDelta()` P2P body with explicit same-rank path.
-6. Add `r_return < block_size` assertion to `MassReturn` constructor.
-7. Implement `CollectLocalParticlesInfo()` P2P for `r_return > 0`.
-8. Split `CollectGlobalParticlesInfo()` + move to `Mesh::UserWorkInLoop()` for `r_return == 0`.
-9. Run regression and conservation checks.
-
----
+1. Add the operator-split mass-return task hook and dependencies.
+2. Add rank-level exchange/mailbox helper and safe tag assertions.
+3. Add and preserve ghost origin fields through particle storage operations.
+4. Convert accretion-delta return to owner-routed exchange.
+5. Split mass return into collect, deposit, and commit phases.
+6. Implement local `r_return > 0` routing with boundary-aware overlap checks.
+7. Implement once-per-rank global paths for `r_return == 0`.
+8. Remove the `USERWORK` mass-return hack.
+9. Run multi-MeshBlock/rank and boundary-combination tests.
 
 ## Verification
 
-1. Build MPI: `configure.py --prob=tigress_classic -b -mpi --cr=mg && make all -j4`
-2. Build serial: `configure.py --prob=tigress_classic -b && make all -j4`
-3. Regression: `cd tst/regression && python run_tests.py scripts/tests/par/`
-4. Short CRMHD run at 1, 2, 4, 8 ranks; diff `.hst` files — mass must be conserved
-5. Grep check: `grep -n Allgatherv src/particles/complex_particles.cpp src/particles/mass_return.cpp`
-   — must find Allgatherv ONLY in `CollectGlobalParticlesInfo()` (r_return == 0)
-6. ★ Conservation unit test: single sink particle near a 3-rank corner; verify
-   total accreted mass matches grid mass removed across all ranks
-
-## Known limitation (carried forward)
-
-`MPI_Allreduce(total_mass_return)` in `ReturnMassFromParticles()` remains. It is a
-genuine global sum and is not per-MeshBlock (runs once per returning particle per cycle).
-Replace in a follow-up with per-neighbor accumulation if needed.
+1. Build MPI and serial `tigress_classic`.
+2. Run with at least two MeshBlocks per rank and non-uniform MeshBlocks per rank if the
+   driver can create that layout.
+3. Run shear-periodic x/y with disk/outflow z boundaries.
+4. Compare 1, 2, 4, and 8 rank short runs for conserved mass and deterministic particle
+   mass histories where expected.
+5. Grep for `Allgatherv` and `Allreduce` in particle mass-return code. Any remaining
+   collective must be in a once-per-rank task phase.
+6. Test a particle near a shear-periodic corner and a particle near a vertical boundary.

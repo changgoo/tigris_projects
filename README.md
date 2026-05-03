@@ -105,16 +105,20 @@ Goal: migrate `athena_fft` from the Plimpton C backend to fftMPI, implement
 
 ---
 
-## particles_p2p/ — Replace MPI_Allgatherv with P2P in ghost particle return
+## particles_p2p/ — Refactor particle return communication
 
-Goal: replace collective communication in `ExchangeGhostAccretionDelta()` and
-`MassReturn::CollectParticlesInfo()` with neighbor-only `MPI_Isend/Irecv`,
-removing the O(nranks) scaling and the uniform-MeshBlocks/rank requirement.
+Goal: replace per-MeshBlock collective communication in `ExchangeGhostAccretionDelta()`
+and `MassReturn::CollectParticlesInfo()` with task-flow-aware, rank-level exchanges,
+removing the O(nranks) scaling path where local communication is sufficient and
+relaxing the uniform-MeshBlocks/rank requirement.
 
 | File | Description |
 |------|-------------|
 | `context.md` | Problem background, current code analysis, existing P2P infrastructure |
-| `plan.md` | Implementation design: origin tracking, delta buffers, tag scheme, step-by-step changes |
+| `plan.md` | Active implementation design: task-flow hook, rank-level exchange, origin tracking, boundary-safe mass return |
+| `review.md` | First review of the original P2P plan |
+| `review_taskflow.md` | Second review focused on task flow, multi-MeshBlock/rank, and boundary compatibility |
+| `plan_rev2_obsolete.md` | Superseded rev-2 plan kept only for historical comparison |
 
 **Related issues / PRs**
 
