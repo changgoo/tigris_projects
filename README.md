@@ -20,6 +20,15 @@ Notes, plans, and documentation generated during development of
 |------|-------------|
 | `conservation_fix.md` | FOFC conservation violation: root cause, options, and fix |
 
+**Related PRs**
+
+| # | Title | State |
+|---|-------|-------|
+| [#255](https://github.com/PrincetonUniversity/tigris/pull/255) | FOFC for CR and shear BCs | MERGED |
+| [#260](https://github.com/PrincetonUniversity/tigris/pull/260) | Multiple Fixes for FOFC | MERGED |
+| [#263](https://github.com/PrincetonUniversity/tigris/pull/263) | Implement implicit solver and optimize fofc array handling | MERGED |
+| [#279](https://github.com/PrincetonUniversity/tigris/pull/279) | Guard FOFC test for isothermal EOS | MERGED |
+
 ---
 
 ## outputs/ — output format documentation
@@ -27,6 +36,16 @@ Notes, plans, and documentation generated during development of
 | File | Description |
 |------|-------------|
 | `zprof_outputs.md` | ZprofOutput expected column definitions |
+
+**Related PRs**
+
+| # | Title | State |
+|---|-------|-------|
+| [#230](https://github.com/PrincetonUniversity/tigris/pull/230) | Add heating calculation for CR in ZprofOutput | MERGED |
+| [#233](https://github.com/PrincetonUniversity/tigris/pull/233) | Additional zprof outputs | MERGED |
+| [#251](https://github.com/PrincetonUniversity/tigris/pull/251) | Add the effective CR transport velocity calculation in zprof output | MERGED |
+| [#265](https://github.com/PrincetonUniversity/tigris/pull/265) | Add CR flux decomposition along B to zprof | MERGED |
+| [#272](https://github.com/PrincetonUniversity/tigris/pull/272) | Added work terms due to magnetic fields (pressure/tension separated) | MERGED |
 
 ---
 
@@ -55,6 +74,16 @@ Goal: migrate `athena_fft` from the Plimpton C backend to fftMPI, implement
 | `04_fft_gravity_bc_parity.md` | Design: extending FFTGravity to open and disk BCs |
 | `06_swing_regression.md` | Regression test plan using `swing.py` (shearing-periodic BC guard) |
 
+**Related PRs**
+
+| # | Title | State |
+|---|-------|-------|
+| [#280](https://github.com/PrincetonUniversity/tigris/pull/280) | Extend AthenaFFT gravity for open and disk boundary conditions | MERGED |
+| [#281](https://github.com/PrincetonUniversity/tigris/pull/281) | FFT gravity: shearing-periodic BC + decomp-independent disk BC + streamlining | MERGED |
+| [#282](https://github.com/PrincetonUniversity/tigris/pull/282) | Use column-wise shearing remap for AthenaFFT gravity | MERGED |
+| [#283](https://github.com/PrincetonUniversity/tigris/pull/283) | ShearingRemapper: replace global-row exchange with MeshBlock-local remap for FFT gravity | MERGED |
+| [#277](https://github.com/PrincetonUniversity/tigris/pull/277) | Complete FFT gravity migration: fftMPI backend + full BC support in FFTGravity | OPEN |
+
 ---
 
 ## particles/ — particle system work
@@ -63,3 +92,13 @@ Goal: migrate `athena_fft` from the Plimpton C backend to fftMPI, implement
 |------|-------------|
 | `overlap_context.md` | Session context: particle overlap logic, flags, CV checks, known issues |
 | `accretion_conservation.md` | Accretion mass conservation: diagnosis and fixes for shear-periodic and pid=NEW bugs |
+
+**Related PRs**
+
+| # | Title | State |
+|---|-------|-------|
+| [#234](https://github.com/PrincetonUniversity/tigris/pull/234) | Complex Particles | MERGED |
+| [#235](https://github.com/PrincetonUniversity/tigris/pull/235) | Accretion | MERGED |
+| [#238](https://github.com/PrincetonUniversity/tigris/pull/238) | Mass Return | MERGED |
+| [#267](https://github.com/PrincetonUniversity/tigris/pull/267) | Add particle momentum and kinetic energy for history | MERGED |
+| [#268](https://github.com/PrincetonUniversity/tigris/pull/268) | Ghost particle output in parbin + Python flag helper | MERGED |
