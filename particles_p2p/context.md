@@ -64,10 +64,13 @@ deposit mass within the return radius.
 **Two return modes controlled by `r_return`:**
 - `r_return > 0`: geometrically local — only blocks within `r_return` of the particle
   position are affected. P2P is valid only if routing uses the actual MeshBlock
-  neighbor/boundary geometry.
-- `r_return == 0` (global): mass is spread across ALL cells proportionally. Every rank
-  genuinely needs the particle list. A global collective is still appropriate, but it
-  must be called once per rank from the mass-return task hook, not once per MeshBlock.
+  neighbor/boundary geometry. `r_return` is a physical radius, so this can involve one
+  MeshBlock, several adjacent MeshBlocks, or more than one neighbor layer if the radius
+  is large enough.
+- `r_return == 0` (global): mass is spread across ALL cells proportionally. This mode
+  is unlikely to be useful and is not the priority for this refactor. If supporting it
+  adds significant complexity, explicitly reject it at runtime and revisit in a later
+  PR.
 
 After `ReturnMassFromParticles()` deposits mass, a second collective:
 ```cpp
@@ -76,7 +79,8 @@ MPI_Allreduce(total_mass_return, npar_global, MPI_SUM, MPI_COMM_WORLD)
 sums up each particle's total deposited mass across ranks so the owner can subtract it
 from the particle. This reduction is globally meaningful, but the old per-MeshBlock
 call pattern is not valid for multi-MeshBlock/rank. It must be moved into the same
-rank-cooperative mass-return commit phase or replaced with owner-directed P2P totals.
+rank-cooperative mass-return commit phase, replaced with owner-directed P2P totals, or
+left unsupported for `r_return == 0` in the first implementation.
 
 ---
 
@@ -119,7 +123,10 @@ The implementation must support arbitrary active boundary combinations, especial
 
 Routing must use `pbval_->neighbor`, global block IDs, ranks, buffer IDs, and existing
 boundary/shear transforms. Do not infer communication partners from coordinate wrapping
-alone. `pid=NEW` matching must remain position-aware and shear-aware.
+alone. `pid=NEW` matching must remain position-aware and shear-aware. For `r_return > 0`,
+the affected-block set is defined by physical overlap between the return sphere and
+MeshBlock domains, not by a hard-coded one-neighbor stencil unless that stencil is
+guarded by an explicit physical-radius assertion.
 
 ---
 
@@ -178,7 +185,8 @@ Currently does NOT record which neighbor the ghost came from — this is the key
   iterates per-neighbor buffer instead of one global array
 - `CopyPeriodicPositions`, `ReturnMassFromOneParticle`, `ReturnMassFromOneParticleGlobal`
   numerical kernels, except for call-site/argument changes needed by the new task flow
-- The global semantics of `r_return == 0`: every rank still deposits global return
+- `r_return == 0` physics semantics if it is implemented later; the first P2P refactor
+  may reject this mode
 - The conservation requirement that owners subtract exactly the mass/energy deposited
 
 ---

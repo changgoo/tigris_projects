@@ -15,6 +15,8 @@ restores the concrete rev-2 implementation details needed for coding.
    accretion-delta path with position- and shear-aware matching.
 7. Route through `pbval_->neighbor`, gids, ranks, `targetid`, and existing boundary/shear
    transforms. Do not infer partners from coordinate wrapping alone.
+8. Prioritize `r_return > 0`. If `r_return == 0` adds significant complexity, reject it
+   at runtime and defer global return to a follow-up PR.
 
 ## Files Changed
 
@@ -137,22 +139,27 @@ ghost_accretion_origin_gid_.push_back(origin_gid_(k));
 This fixes the index-misalignment bug: the vector index `g` counts accreting ghosts,
 not ghost storage order.
 
-### `r_return` Assertion
+### `r_return` Geometry
 
-In the `MassReturn` constructor:
+`r_return` is a physical radius, not a cell-count limit. The implementation must not
+assert `r_return < min(meshblock.nx*)`. Local return means "finite-radius return", not
+"single-MeshBlock return."
+
+For `r_return > 0`, route each returning particle to every MeshBlock whose physical
+domain can intersect the sphere of radius `r_return` around the particle, including
+same-rank MeshBlocks and remote MeshBlocks. A single particle may therefore deposit on
+one MeshBlock, several neighboring MeshBlocks, or more than the immediate neighbor
+stencil if `r_return` is large enough.
+
+If the first implementation only supports the existing ghost-neighbor stencil, add an
+explicit runtime assertion on the physical radius:
 
 ```cpp
-if (r_return > 0) {
-  int min_block_cells = std::min({pmy_block->block_size.nx1,
-                                   pmy_block->block_size.nx2,
-                                   pmy_block->block_size.nx3});
-  if (r_return >= min_block_cells - 1)
-    ATHENA_ERROR("r_return exceeds MeshBlock size; P2P mass return is invalid");
-}
+r_return <= max_supported_exchange_distance
 ```
 
-If `r_return` is physical length rather than cells, replace this with the equivalent
-physical block-extent assertion before implementation.
+where `max_supported_exchange_distance` is derived from physical block extents and the
+actual exchange stencil. Do not express this as a raw cell-count comparison.
 
 ## Exchange Manager Design
 
@@ -201,16 +208,20 @@ Each local MeshBlock contributes active, non-ghost particles due for return. Onl
 `pid >= 0` is eligible; `pid == NEW` or `pid == DEL` with positive return is an error or
 an explicit diagnostic skip.
 
-- `r_return > 0`: route records only to MeshBlocks whose domains can overlap the return
-  region, using existing neighbor/boundary metadata and shear transforms.
-- `r_return == 0`: gather the returning-particle list once per rank because every rank
-  deposits global return.
+- `r_return > 0`: route records to every MeshBlock whose physical domain can overlap
+  the return sphere, using block geometry, neighbor/boundary metadata, and shear
+  transforms. This may include multiple MeshBlocks per particle; it is not restricted
+  to purely local cells or a single immediate neighbor.
+- `r_return == 0`: optional/deferred. If this path stays simple, gather the returning
+  particle list once per rank because every rank deposits global return. If it complicates
+  the rank-level task split, reject with `ATHENA_ERROR` and document a follow-up.
 
 ### `MASS_RETURN_DEPOSIT`
 
-Each MeshBlock deposits from its delivered records. Reuse `ReturnMassFromOneParticle`
-and `ReturnMassFromOneParticleGlobal`, but their input list is pre-collected. Receiving
-blocks still filter geometrically. Each block records deposited totals:
+Each MeshBlock deposits from its delivered records. The first implementation should focus
+on `ReturnMassFromOneParticle` for `r_return > 0`. Reuse `ReturnMassFromOneParticleGlobal`
+only if global return remains supported. Receiving blocks still filter geometrically.
+Each block records deposited totals:
 
 ```text
 [owner_rank, owner_gid, pid, xp, yp, zp, deposited_mass_or_vars...]
@@ -224,20 +235,29 @@ records must have `pid >= 0`.
 For `r_return > 0`, aggregate local deposited totals and return them to owner rank/gid
 with the rank exchange manager.
 
-For `r_return == 0`, use one vector `MPI_Allreduce`, not one reduction per particle.
-Build a deterministic list of collected `pid >= 0` values during `MASS_RETURN_COLLECT`
-or allocate by global `max_pid + 1` if memory is acceptable. Each rank contributes the
-deposited total at that particle's index; owners subtract their entry from the active
-particle. Negative sentinel IDs cannot appear as keys.
+If `r_return == 0` is kept, use one vector `MPI_Allreduce`, not one reduction per
+particle. Build a deterministic list of collected `pid >= 0` values during
+`MASS_RETURN_COLLECT` or allocate by global `max_pid + 1` if memory is acceptable. Each
+rank contributes the deposited total at that particle's index; owners subtract their
+entry from the active particle. Negative sentinel IDs cannot appear as keys.
+
+If this global path makes the first refactor materially harder, add an input/runtime
+guard:
+
+```cpp
+if (r_return == 0)
+  ATHENA_ERROR("Global mass return is temporarily unsupported by P2P mass return");
+```
 
 No `MPI_Allreduce(total_mass_return, ...)` may remain inside a per-MeshBlock method.
 
 ## Boundary Requirements
 
 Support shear-periodic x/y, disk/outflow/open z, same-rank neighbors, cross-rank
-neighbors, and non-uniform MeshBlocks per rank. Outflow/open/disk boundaries do not
-create phantom periodic partners. Periodic/shear image positions must use existing
-boundary transforms, not manual all-direction wrapping.
+neighbors, non-uniform MeshBlocks per rank, and finite-radius return regions that span
+multiple MeshBlocks. Outflow/open/disk boundaries do not create phantom periodic
+partners. Periodic/shear image positions must use existing boundary transforms, not
+manual all-direction wrapping.
 
 ## Implementation Sequence
 
@@ -248,9 +268,11 @@ boundary transforms, not manual all-direction wrapping.
    delta apply, and feedback injection.
 5. Convert accretion-delta return to owner-routed exchange.
 6. Split mass return into collect/deposit/commit and exclude `pid < 0`.
-7. Implement `r_return > 0` boundary-aware routing and `r_return == 0` vector reduction.
-8. Remove the `USERWORK` mass-return hook.
-9. Run verification below.
+7. Implement `r_return > 0` physical-overlap routing across all affected MeshBlocks.
+8. Either implement `r_return == 0` as a once-per-rank vector reduction or add a clear
+   runtime guard that defers global return.
+9. Remove the `USERWORK` mass-return hook.
+10. Run verification below.
 
 ## Verification
 
@@ -260,10 +282,15 @@ boundary transforms, not manual all-direction wrapping.
 3. Prefer a 2-rank non-uniform case, e.g. rank 0 owns two MeshBlocks and rank 1 owns one,
    if mesh decomposition can be configured that way.
 4. Run shear-periodic x/y with disk/outflow z boundaries.
-5. Check deterministic results at fixed nranks. Do not require bitwise identity across
+5. Test `r_return > 0` cases where the return sphere is contained in one MeshBlock,
+   crosses one MeshBlock boundary, crosses an edge/corner, and spans more than one
+   neighbor layer if that radius is supported.
+6. Check deterministic results at fixed nranks. Do not require bitwise identity across
    different nranks because P2P aggregation changes floating-point summation order.
-6. Grep particle mass-return code for `Allgatherv` and `Allreduce`; any remaining
+7. Grep particle mass-return code for `Allgatherv` and `Allreduce`; any remaining
    collective must be in a once-per-rank phase.
-7. Create multiple NEW particles on different MeshBlocks of the same rank and verify
+8. Create multiple NEW particles on different MeshBlocks of the same rank and verify
    `ProcessNewParticles` assigns unique IDs after operator-split physics.
-8. Test particles near a shear-periodic corner and near a vertical disk/outflow boundary.
+9. Test particles near a shear-periodic corner and near a vertical disk/outflow boundary.
+10. If `r_return == 0` is deferred, verify the runtime guard fails early with a clear
+    message.
