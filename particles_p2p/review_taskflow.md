@@ -55,6 +55,18 @@ Global return genuinely needs every rank to know the active returning particle l
 Keeping Allgatherv is acceptable only if it is called once per rank from the mass-return
 task hook. The deposited-total reduction has the same rule.
 
+### 6. NEW particle IDs are assigned after operator-split physics
+
+`Particles::ProcessNewParticles(pmesh, ipar)` is not the weak point: it is already a
+mesh-level routine that loops over every local MeshBlock, all-reduces counts by global
+block ID, and assigns deterministic unique IDs in gid order. That pattern is compatible
+with multiple MeshBlocks per rank.
+
+The refactor hazard is ordering. The proposed mass-return task runs before
+`ProcessNewParticles`, so `pid == NEW` is still ambiguous during mass-return collect.
+Mass return must exclude or error on `pid < 0` particles. Accretion-delta return may
+continue to use `pid == NEW`, but only with position-aware and shear-aware matching.
+
 ## Required task-flow shape
 
 Add mass return as a named operator-split subphase before cooling:
@@ -81,5 +93,6 @@ Collect/exchange/commit are rank-cooperative. Deposit is per MeshBlock.
 4. Preserve arbitrary boundary behavior. Use existing neighbor lists, boundary flags,
    and shear transforms; do not infer neighbors from coordinate wrapping alone.
 5. Keep `pid=NEW` matching position-aware and shear-aware.
-6. Verify with at least one multi-MeshBlock/rank run and one shear-periodic + vertical
+6. Keep `Particles::ProcessNewParticles` mesh-level and post-operator-split.
+7. Verify with at least one multi-MeshBlock/rank run and one shear-periodic + vertical
    disk/outflow configuration.

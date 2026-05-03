@@ -98,6 +98,14 @@ recvgpar
 The exact task names can follow Athena++ conventions, but the ownership split is fixed:
 collect/exchange/commit run once per rank; deposit runs per MeshBlock.
 
+`Particles::ProcessNewParticles(pmesh, ipar)` is already a mesh-level operation: it
+counts `pid == NEW` particles on every local MeshBlock, all-reduces counts indexed by
+global block ID, and assigns IDs in deterministic gid order. This is compatible with
+multiple MeshBlocks per rank and must remain outside per-MeshBlock task execution.
+The new mass-return task runs before this ID assignment, so mass-return collection must
+ignore or reject `pid < 0` particles. Accretion-delta return is the only phase that may
+communicate `pid == NEW`, and it must keep position/shear matching until IDs are assigned.
+
 ---
 
 ## Boundary-condition requirements
@@ -182,5 +190,7 @@ Currently does NOT record which neighbor the ghost came from — this is the key
 3. Treat same-rank MeshBlock-to-MeshBlock delivery as real communication through an
    explicit local mailbox or rank-level exchange object.
 4. Preserve boundary-condition generality; do not assume all boundaries are periodic.
-5. Before editing code, trace the task dependency that gives mass return fresh ghost
+5. Do not change `Particles::ProcessNewParticles` into a per-MeshBlock task; it is the
+   mesh-level barrier that makes `pid == NEW` unique after operator-split physics.
+6. Before editing code, trace the task dependency that gives mass return fresh ghost
    zones and still places it before cooling.

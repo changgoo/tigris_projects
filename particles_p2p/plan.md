@@ -14,6 +14,8 @@ all communication phases must support multiple MeshBlocks per rank.
 5. Boundary routing must use existing neighbor lists, block IDs, ranks, buffer IDs, and
    shear/boundary transforms. Do not assume all directions are periodic.
 6. `pid=NEW` matching remains position-aware and shear-aware.
+7. Keep `Particles::ProcessNewParticles` as a mesh-level post-operator-split barrier.
+   Do not move particle ID assignment into per-MeshBlock tasks.
 
 ## Files changed
 
@@ -44,6 +46,12 @@ recvgpar
 `REFRESH_MR_GHOSTS` can reuse existing hydro/scalar boundary communication machinery,
 but it must be a real task dependency. This replaces the temporary reason for calling
 mass return from `USERWORK`.
+
+`Particles::ProcessNewParticles(pmesh, ipar)` remains after operator-split physics. It
+already supports multiple MeshBlocks per rank by counting new particles per global block
+ID, all-reducing the count vector, and assigning IDs in gid order. Because the new
+mass-return hook runs before this ID update, mass return must not depend on `pid == NEW`
+being globally unique.
 
 ## Step 1 — Ghost origin tracking for accretion deltas
 
@@ -127,6 +135,10 @@ That is an error unless the particle was already deleted by a documented path.
 ### `MASS_RETURN_COLLECT` — once per rank
 
 Each local MeshBlock contributes active, non-ghost particles due for mass return.
+Only particles with stable IDs (`pid >= 0`) are eligible. If `CalculateMassReturn()`
+would return positive mass for `pid == NEW` or `pid == DEL`, treat that as an error or
+skip with an explicit diagnostic; never put negative sentinel IDs into the mass-return
+owner/reduction key.
 Then:
 
 - `r_return > 0`: send records only to ranks/blocks whose domains may overlap the
@@ -189,11 +201,13 @@ should return to diagnostics/history/output work only.
 2. Add rank-level exchange/mailbox helper and safe tag assertions.
 3. Add and preserve ghost origin fields through particle storage operations.
 4. Convert accretion-delta return to owner-routed exchange.
-5. Split mass return into collect, deposit, and commit phases.
-6. Implement local `r_return > 0` routing with boundary-aware overlap checks.
-7. Implement once-per-rank global paths for `r_return == 0`.
-8. Remove the `USERWORK` mass-return hack.
-9. Run multi-MeshBlock/rank and boundary-combination tests.
+5. Audit `ProcessNewParticles` call order and add guards so mass-return collect excludes
+   `pid < 0` sentinels before ID assignment.
+6. Split mass return into collect, deposit, and commit phases.
+7. Implement local `r_return > 0` routing with boundary-aware overlap checks.
+8. Implement once-per-rank global paths for `r_return == 0`.
+9. Remove the `USERWORK` mass-return hack.
+10. Run multi-MeshBlock/rank and boundary-combination tests.
 
 ## Verification
 
@@ -205,4 +219,6 @@ should return to diagnostics/history/output work only.
    mass histories where expected.
 5. Grep for `Allgatherv` and `Allreduce` in particle mass-return code. Any remaining
    collective must be in a once-per-rank task phase.
-6. Test a particle near a shear-periodic corner and a particle near a vertical boundary.
+6. Create multiple NEW particles on different MeshBlocks of the same rank and verify
+   `ProcessNewParticles` assigns unique IDs after operator-split physics.
+7. Test a particle near a shear-periodic corner and a particle near a vertical boundary.
