@@ -1,42 +1,11 @@
-# TIGRIS — CRMHD / tigress_classic
+# TIGRIS — Source Code Structure
 
 TIGRIS is a private fork of Athena++ (grid-based GRMHD + AMR) extended with ISM physics.
-Primary use case here: **CRMHD simulations** with the `tigress_classic` problem generator.
+Primary use case: **CRMHD simulations** with the `tigress_classic` problem generator.
 
-- Main branch for PRs: **`tigris-master`**
+- Base code: `$HOME/tigris` (branch: `tigris-master`)
 - Scripts repo: `$HOME/tigris_scripts/tigress_classic/`
 - Doxygen docs: https://changgoo.github.io/athena
-
-## Build
-
-```bash
-# From $HOME/tigris_scripts/tigress_classic/
-./build_tigress.sh tiger crmhd
-# Usage: ./build_tigress.sh <machine> <physics> [build_option] [src_dir] [flux]
-#   machine: tiger | stellar | anvil
-#   physics: crmhd | crmhd_duale | crmhd_duals | mhd | hydro | ...
-#   build_option: 0=normal (default), 1=debug (g++), 2=no-clean
-```
-
-What this does for `tiger crmhd`:
-1. Loads intel-oneapi/2024.2, openmpi, hdf5, fftw modules
-2. Runs `configure.py` with:
-   ```
-   --prob=tigress_classic --nghost=4 -fft -fb --grav=blockfft -mpi -hdf5
-   -b --cr=mg --flux=hlld --cxx=icpx
-   ```
-3. `make all -j4`
-4. Copies binary to `tiger/tigris_crmhd.exe`
-
-Key `configure.py` flags for CRMHD:
-| Flag | Meaning |
-|------|---------|
-| `-b` | Enable MHD (magnetic fields) |
-| `--cr=mg` | Cosmic ray transport via multigroup |
-| `--flux=hlld` | HLLD Riemann solver |
-| `-fb` | Enable feedback module |
-| `--grav=blockfft` | Block-FFT self-gravity |
-| `--nghost=4` | 4 ghost cells (required) |
 
 ## Source Layout (CRMHD-relevant)
 
@@ -50,7 +19,15 @@ src/
   field/                           # Magnetic field evolution (CT)
   eos/                             # Equation of state (adiabatic γ=5/3)
   cr/, cr_mg/                      # Cosmic ray transport — multigroup (streaming, diffusion)
-  gravity/                         # Block-FFT self-gravity
+  fft/                             # Distributed FFT infrastructure
+    athena_fft.hpp/cpp             # FFTBlock — multi-meshblock FFT (cuboid, fftmpi backend)
+    fft_driver.cpp                 # FFTDriver — cuboid MeshBlock grouping, plan creation
+    block_fft.hpp/cpp              # BlockFFT — single-meshblock FFT (1 MB/rank, MPI only)
+    fftmpi/                        # fftMPI C++ library (active backend)
+    plimpton/                      # Plimpton C library (legacy, being retired)
+  gravity/                         # Self-gravity (block-FFT Poisson solvers)
+    fft_gravity.hpp/cpp            # FFTGravity : FFTBlock — multi-MB/rank, periodic/open/disk/shear BCs
+    block_fft_gravity.hpp/cpp      # BlockFFTGravity : BlockFFT — 1 MB/rank, all BCs (legacy)
   particles/                       # Stellar/complex particles
     particles.hpp/cpp              # Base particle class
     complex_particles.cpp          # Star particles (accretion, mass return)
@@ -101,7 +78,32 @@ Key blocks and their roles:
 
 Output types: `hst`, `hdf5` (prim + uov), `parbin`, `rst`, `phase_hst`, `zprof`
 
-## Key Physics Notes
+## Execution Flow
+
+Per-cycle loop in `main.cpp`:
+
+```
+for stage in [1, 2]:                         ← RK2 stages
+    TimeIntegratorTaskList(stage)            ← MHD, CR, scalars, particle motion
+    BlockFFT/FFTGravity::Solve(stage)        ← Poisson gravity (between stages)
+
+OperatorSplitTaskList()                      ← once per cycle (ops_task=true):
+    CREATE_PAR → SET_FBR → SEND/RECV_GPAR
+    → INTERACT (Merge→Accrete→Feedback)
+    → OPS_INT_COOLING → REMOVE_PAR
+    → boundary comms → CONS2PRIM → USERWORK
+
+Particles::ProcessNewParticles()             ← assign global IDs to new particles
+```
+
+`INT_PAR` (particle trajectory integration) uses primitives from the **previous** RK
+stage — intentional, so results are deterministic across MPI configurations.
+`USERWORK` calls `UserWorkInLoop()` from `tigress_classic.cpp`: history, phase
+diagnostics, z-profile outputs.
+
+See `TASKLIST.md` for the full task-dependency graph.
+
+## Key Physics
 
 - **Domain**: Stratified shearing box, typically 1×1×6 kpc (64×64×384 cells at 16 pc/cell)
 - **CR transport**: multigroup (`--cr=mg`), streaming + diffusion + losses, self-consistent Alfven speed
@@ -143,8 +145,8 @@ CREATE_PAR → SET_FBR → SEND_GPAR/RECV_GPAR
 
 When a particle near a boundary accretes gas, both the **active** copy (on the origin
 MeshBlock) and the **ghost** copy (on the neighbor) may accrete from their respective
-cells. The `ExchangeGhostAccretionDelta()` function communicates ghost accretion deltas
-back to the origin so that the particle's total accreted mass is correct and conserved.
+cells. `ExchangeGhostAccretionDelta()` communicates ghost accretion deltas back to the
+origin so that the particle's total accreted mass is correct and conserved.
 
 Currently uses `MPI_Allgatherv` (known limitation — see GitHub issue for P2P refactor plan).
 
@@ -156,9 +158,8 @@ neighboring blocks changes with time (`qshear * Omega0 * Lx * t`). Key concerns:
 - Ghost particles must have their positions shifted by the shear offset
 - `noverlap_` controls how many copies of each near-boundary particle are created
   (set to `NGHOST` to ensure proximity checks work correctly)
-- FOFC (first-order flux correction) is **skipped on MeshBlock boundary faces**
-  (`first_order_flux_correction.cpp`) to avoid conservation issues at shear-periodic
-  interfaces
+- FOFC is **skipped on MeshBlock boundary faces** (`first_order_flux_correction.cpp`)
+  to avoid conservation issues at shear-periodic interfaces
 
 ## FOFC (First-Order Flux Correction)
 
@@ -168,16 +169,10 @@ this can create conservation mismatches because neighboring blocks may apply dif
 flux corrections. Current fix: skip FOFC for boundary faces entirely
 (`first_order_flux_correction.cpp`).
 
-## Testing
-
-```bash
-cd tst/regression
-python run_tests.py                     # all regression tests
-./test_mpi.sh                           # MPI-specific tests
-```
-
 ## Coding Conventions
-- C++11/14, BSD 3-Clause license
-- Follow Athena++ style guide (snake_case, Doxygen comments)
-- Add regression test for new functionality
+
+- C++11, BSD 3-Clause license
+- Follow Athena++ style guide (snake_case, Doxygen comments; tst/style/check_athena_cpp_style.sh)
+- Python code linting (flake8)
+- Add regression test for new functionality (tst/regression)
 - Reference issue numbers in commits: `Fixes #42`
