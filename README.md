@@ -102,3 +102,22 @@ Goal: migrate `athena_fft` from the Plimpton C backend to fftMPI, implement
 | [#238](https://github.com/PrincetonUniversity/tigris/pull/238) | Mass Return | MERGED |
 | [#267](https://github.com/PrincetonUniversity/tigris/pull/267) | Add particle momentum and kinetic energy for history | MERGED |
 | [#268](https://github.com/PrincetonUniversity/tigris/pull/268) | Ghost particle output in parbin + Python flag helper | MERGED |
+
+---
+
+## particles_p2p/ — Replace MPI_Allgatherv with P2P in ghost particle return
+
+Goal: replace collective communication in `ExchangeGhostAccretionDelta()` and
+`MassReturn::CollectParticlesInfo()` with neighbor-only `MPI_Isend/Irecv`,
+removing the O(nranks) scaling and the uniform-MeshBlocks/rank requirement.
+
+| File | Description |
+|------|-------------|
+| `context.md` | Problem background, current code analysis, existing P2P infrastructure |
+| `plan.md` | Implementation design: origin tracking, delta buffers, tag scheme, step-by-step changes |
+
+**Related issues / PRs**
+
+| # | Title | State |
+|---|-------|-------|
+| [#269](https://github.com/PrincetonUniversity/tigris/issues/269) | Replace MPI_Allgatherv with point-to-point comm for ghost particle return data | OPEN |
