@@ -23,6 +23,11 @@ must call it the same number of times. Both calls happen inside the per-MeshBloc
 INTERACT task (`OperatorSplitTaskList`). If ranks ever own different numbers of
 MeshBlocks (AMR, load balancing), the collective deadlocks.
 
+Non-uniform MeshBlocks/rank is a useful future capability, but it is not the main target
+for the first refactor because FFT gravity configurations are unlikely to use it. The
+first priority is multi-MeshBlock/rank with normal uniform ownership, same-rank routing,
+and finite-radius mass return across affected MeshBlocks.
+
 **Task-flow problem**: Mass return is currently routed through `USERWORK` as a
 temporary hack so it can read updated ghost zones. That is not an acceptable final
 location. `USERWORK` runs after cooling, boundary updates, primitive recovery, physical
@@ -119,7 +124,8 @@ The implementation must support arbitrary active boundary combinations, especial
 - shear-periodic in x/y,
 - disk, outflow, or open boundaries in z,
 - same-rank neighboring MeshBlocks,
-- multi-MeshBlock/rank layouts that are not uniform across ranks.
+- multiple MeshBlocks per rank. Non-uniform MeshBlocks/rank should be supported if it
+  falls out naturally, but can be deferred if it adds substantial complexity.
 
 Routing must use `pbval_->neighbor`, global block IDs, ranks, buffer IDs, and existing
 boundary/shear transforms. Do not infer communication partners from coordinate wrapping

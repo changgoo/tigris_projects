@@ -17,6 +17,9 @@ restores the concrete rev-2 implementation details needed for coding.
    transforms. Do not infer partners from coordinate wrapping alone.
 8. Prioritize `r_return > 0`. If `r_return == 0` adds significant complexity, reject it
    at runtime and defer global return to a follow-up PR.
+9. Support multiple MeshBlocks per rank. Non-uniform MeshBlocks/rank is desirable, but
+   not a first-PR blocker when combined with FFT gravity constraints; defer it if it
+   materially complicates the implementation.
 
 ## Files Changed
 
@@ -254,10 +257,12 @@ No `MPI_Allreduce(total_mass_return, ...)` may remain inside a per-MeshBlock met
 ## Boundary Requirements
 
 Support shear-periodic x/y, disk/outflow/open z, same-rank neighbors, cross-rank
-neighbors, non-uniform MeshBlocks per rank, and finite-radius return regions that span
-multiple MeshBlocks. Outflow/open/disk boundaries do not create phantom periodic
-partners. Periodic/shear image positions must use existing boundary transforms, not
-manual all-direction wrapping.
+neighbors, multiple MeshBlocks per rank, and finite-radius return regions that span
+multiple MeshBlocks. Non-uniform MeshBlocks/rank should work if the rank-level design
+naturally supports it, but it can be deferred because FFT gravity configurations are
+unlikely to use it. Outflow/open/disk boundaries do not create phantom periodic partners.
+Periodic/shear image positions must use existing boundary transforms, not manual
+all-direction wrapping.
 
 ## Implementation Sequence
 
@@ -271,16 +276,17 @@ manual all-direction wrapping.
 7. Implement `r_return > 0` physical-overlap routing across all affected MeshBlocks.
 8. Either implement `r_return == 0` as a once-per-rank vector reduction or add a clear
    runtime guard that defers global return.
-9. Remove the `USERWORK` mass-return hook.
-10. Run verification below.
+9. Keep non-uniform MeshBlocks/rank support if it falls out naturally; otherwise document
+   the uniform-ownership assumption and open a follow-up.
+10. Remove the `USERWORK` mass-return hook.
+11. Run verification below.
 
 ## Verification
 
 1. Build MPI and serial `tigress_classic`.
-2. Run at least one multi-MeshBlock/rank case. If non-uniform ownership cannot be
-   produced by current inputs, document that gap and open a follow-up test issue.
-3. Prefer a 2-rank non-uniform case, e.g. rank 0 owns two MeshBlocks and rank 1 owns one,
-   if mesh decomposition can be configured that way.
+2. Run at least one multi-MeshBlock/rank case with uniform MeshBlock ownership.
+3. Treat non-uniform MeshBlocks/rank as optional verification. If easy, run a 2-rank
+   non-uniform case; otherwise document it as deferred.
 4. Run shear-periodic x/y with disk/outflow z boundaries.
 5. Test `r_return > 0` cases where the return sphere is contained in one MeshBlock,
    crosses one MeshBlock boundary, crosses an edge/corner, and spans more than one

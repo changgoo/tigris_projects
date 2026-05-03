@@ -110,7 +110,8 @@ Goal: migrate `athena_fft` from the Plimpton C backend to fftMPI, implement
 Goal: replace per-MeshBlock collective communication in `ExchangeGhostAccretionDelta()`
 and `MassReturn::CollectParticlesInfo()` with task-flow-aware, rank-level exchanges,
 removing the O(nranks) scaling path where local communication is sufficient and
-relaxing the uniform-MeshBlocks/rank requirement.
+supporting multi-MeshBlock/rank particle return paths. Non-uniform MeshBlocks/rank is a
+desirable follow-up if it does not fall out naturally.
 
 | File | Description |
 |------|-------------|
