@@ -178,8 +178,10 @@ Currently does NOT record which neighbor the ghost came from — this is the key
    flush time) so `ExchangeGhostAccretionDelta` knows where to send each delta.
 
 2. **Return/exchange buffers**: Lightweight buffers for accretion deltas and mass-return
-   particle records. Same-rank delivery needs a rank-local mailbox or rank-level exchange
-   manager, not a copy into the sender object's receive vector.
+   particle records. Same-rank delivery must use the same per-MeshBlock channel
+   abstraction as cross-rank delivery. If MPI loopback is fragile, hide a small
+   `(dst_gid, channel)` mailbox inside that channel; do not add rank-level task-list
+   phases.
 
 3. **Distinct MPI tags**: The new delta-return messages need tags that don't collide with
    existing ghost-particle tags. High-bit tag namespaces are acceptable only with a
@@ -211,8 +213,9 @@ Currently does NOT record which neighbor the ghost came from — this is the key
 
 1. Do not add or keep mass-return physics in `USERWORK`.
 2. Do not call collectives or neighbor exchanges from independent per-MeshBlock loops.
-3. Treat same-rank MeshBlock-to-MeshBlock delivery as real communication through an
-   explicit local mailbox or rank-level exchange object.
+3. Treat same-rank MeshBlock-to-MeshBlock delivery as real per-MeshBlock P2P
+   communication. A local mailbox is acceptable only as an implementation detail inside
+   the channel abstraction.
 4. Preserve boundary-condition generality; do not assume all boundaries are periodic.
 5. Do not change `Particles::ProcessNewParticles` into a per-MeshBlock task; it is the
    mesh-level barrier that makes `pid == NEW` unique after operator-split physics.
@@ -220,3 +223,6 @@ Currently does NOT record which neighbor the ghost came from — this is the key
    zones on all affected MeshBlocks and rely on the existing post-cooling boundary sync.
 7. Implement accretion-delta and mass-return exchanges as per-MeshBlock P2P task-list
    tasks, not rank-level collectives.
+8. Split the implementation into two PRs: first accretion-delta P2P plus shared channel
+   and origin infrastructure, then finite-radius mass return plus removal of the
+   `USERWORK` hook.

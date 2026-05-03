@@ -7,9 +7,11 @@ restores the concrete rev-2 implementation details needed for coding.
 
 1. Do not put mass-return physics in `USERWORK`.
 2. Do not call MPI collectives or neighbor exchanges from independent per-MeshBlock loops.
-3. Rank-level phases collect/exchange/commit once per rank; deposit/apply phases run per MeshBlock.
-4. Same-rank MeshBlocks communicate through a rank-level mailbox, not by writing into
-   the sender object's receive vector.
+3. All new exchange/deposit/apply phases in `OperatorSplitTaskList` are per-MeshBlock
+   tasks. Do not introduce mesh-level or rank-level tasks inside the task list.
+4. Same-rank MeshBlocks communicate through the same per-MeshBlock channel abstraction
+   as cross-rank neighbors. If MPI loopback is not robust, use a small local mailbox
+   hidden inside that channel, not a rank-level task.
 5. Keep `Particles::ProcessNewParticles` mesh-level and post-operator-split.
 6. Exclude `pid < 0` from mass-return collect. `pid == NEW` is allowed only in the
    accretion-delta path with position- and shear-aware matching.
@@ -27,11 +29,48 @@ restores the concrete rev-2 implementation details needed for coding.
 |------|--------|
 | `src/task_list/ops_task_list.hpp` | Add task IDs and declarations for per-MeshBlock P2P exchange phases |
 | `src/task_list/ops_task_list.cpp` | Register per-MeshBlock exchange/deposit/commit tasks before cooling |
-| `src/particles/particles.hpp` | Add origin arrays, tag constants, and rank exchange/mailbox declarations |
+| `src/particles/particles.hpp` | Add origin arrays, tag constants, and per-MeshBlock channel declarations |
 | `src/particles/particles_bvals.cpp` | Preserve origin fields and record source rank/gid on ghost flush |
 | `src/particles/complex_particles.hpp/cpp` | Split accretion from delta exchange/apply; capture ghost origins at push time |
 | `src/particles/mass_return.hpp/cpp` | Split collect, deposit, and commit; remove per-block collectives |
 | `src/pgen/tigress_classic.cpp` | Remove temporary mass-return `USERWORK` hook |
+
+## PR Split
+
+### PR 1: Accretion Delta P2P Infrastructure
+
+This PR should be small enough to review independently and should not move mass return
+out of `USERWORK` yet.
+
+- Add per-MeshBlock channel buffers, channel tag namespaces, and `MPI_TAG_UB` checks.
+- Add and preserve `origin_rank_` / `origin_gid_` through particle migration, ghost
+  receive, deletion swaps, and capacity changes.
+- Extend `FlushReceiveBuffer` so ghost particles know source rank and global block ID.
+- Split `ComplexParticles::InteractWithMesh()` into `INTERACT_PRE_MR`,
+  `SEND/RECV_ACCDELTA`, `ACCRETION_DELTA_APPLY`, and `FEEDBACK_INJECT`.
+- Replace `ExchangeGhostAccretionDelta()` Allgatherv with owner-routed per-MeshBlock
+  P2P delivery.
+
+PR 1 must leave the existing mass-return behavior unchanged except where shared
+infrastructure is added. The acceptance test is that accretion delta return no longer
+uses per-MeshBlock collectives and still works with multiple MeshBlocks per rank,
+including same-rank neighbors and shear-periodic ghost particles.
+
+### PR 2: Mass Return Task Flow
+
+This PR consumes the PR 1 infrastructure and removes the temporary `USERWORK` hook.
+
+- Add finite-radius `SEND/RECV_MR_RECORDS`, `MASS_RETURN_DEPOSIT_ACTIVE`,
+  `SEND/RECV_MR_TOTALS`, and `MASS_RETURN_COMMIT_APPLY` tasks.
+- Route `r_return > 0` records to all represented neighbor-stencil MeshBlocks whose
+  active domains overlap the physical return sphere.
+- Deposit only active zones on receiving MeshBlocks and return deposited totals to the
+  owner block before cooling.
+- Reject or defer `r_return == 0` if it adds significant complexity.
+- Remove `src/pgen/tigress_classic.cpp` mass-return `USERWORK` call.
+
+PR 2 must not add a pre-mass-return hydro/scalar ghost refresh. Existing post-cooling
+hydro/scalar communication remains the synchronization point for active-zone deposits.
 
 ## Final Task Graph
 
@@ -169,7 +208,7 @@ not ghost storage order.
 assert `r_return < min(meshblock.nx*)`. Local return means "finite-radius return", not
 "single-MeshBlock return."
 
-For PR 1, route each returning particle only through the existing neighbor stencil,
+For PR 2, route each returning particle only through the existing neighbor stencil,
 including face/edge/corner neighbors and shear-periodic neighbors represented in the
 particle boundary infrastructure. This supports finite-radius return across the local
 block and represented neighbors. General multi-hop/non-neighbor block lookup is deferred.
@@ -233,8 +272,9 @@ an explicit diagnostic skip.
   neighbor/boundary metadata, and shear transforms. Multi-hop routing beyond this
   stencil is deferred and guarded by `max_supported_exchange_distance`.
 - `r_return == 0`: optional/deferred. If this path stays simple, gather the returning
-  particle list once per rank because every rank deposits global return. If it complicates
-  the rank-level task split, reject with `ATHENA_ERROR` and document a follow-up.
+  particle list in a task-list-safe way because every rank deposits global return. If it
+  complicates the per-MeshBlock task flow, reject with `ATHENA_ERROR` and document a
+  follow-up.
 
 ### `MASS_RETURN_DEPOSIT`
 
@@ -277,31 +317,39 @@ No `MPI_Allreduce(total_mass_return, ...)` may remain inside a per-MeshBlock met
 
 Support shear-periodic x/y, disk/outflow/open z, same-rank neighbors, cross-rank
 neighbors, multiple MeshBlocks per rank, and finite-radius return regions that span
-multiple MeshBlocks. Non-uniform MeshBlocks/rank should work if the rank-level design
-naturally supports it, but it can be deferred because FFT gravity configurations are
+multiple MeshBlocks. Non-uniform MeshBlocks/rank should work if the per-MeshBlock P2P
+design naturally supports it, but it can be deferred because FFT gravity configurations are
 unlikely to use it. Outflow/open/disk boundaries do not create phantom periodic partners.
 Periodic/shear image positions must use existing boundary transforms, not manual
 all-direction wrapping.
 
 ## Implementation Sequence
 
-1. Add per-MeshBlock task IDs/functions in `ops_task_list.hpp/cpp` for the exchange,
-   deposit, and commit tasks above.
-2. Add per-MeshBlock channel buffers and safe tag assertions.
-3. Add/preserve origin fields and `FlushReceiveBuffer` source arguments.
+Follow the PR split above.
+
+For PR 1:
+
+1. Add per-MeshBlock channel buffers and safe tag assertions.
+2. Add/preserve origin fields and `FlushReceiveBuffer` source arguments.
+3. Add per-MeshBlock accretion-delta task IDs/functions in `ops_task_list.hpp/cpp`.
 4. Split `ComplexParticles::InteractWithMesh()` into pre-MR accretion, delta exchange,
    delta apply, and feedback injection.
 5. Convert accretion-delta return to owner-routed per-MeshBlock exchange.
-6. Split mass return into collect/deposit/commit and exclude `pid < 0`; make finite-
+6. Verify no per-MeshBlock collective remains in accretion-delta return.
+
+For PR 2:
+
+1. Add per-MeshBlock mass-return task IDs/functions in `ops_task_list.hpp/cpp`.
+2. Split mass return into collect/deposit/commit and exclude `pid < 0`; make finite-
    radius deposit active-zone-only.
-7. Implement `r_return > 0` neighbor-stencil physical-overlap routing with a physical
+3. Implement `r_return > 0` neighbor-stencil physical-overlap routing with a physical
    radius guard for deferred multi-hop routing.
-8. Either implement `r_return == 0` as a once-per-rank vector reduction or add a clear
-   runtime guard that defers global return.
-9. Keep non-uniform MeshBlocks/rank support if it falls out naturally; otherwise document
+4. Either implement `r_return == 0` as a simple follow-on path or add a clear runtime
+   guard that defers global return.
+5. Keep non-uniform MeshBlocks/rank support if it falls out naturally; otherwise document
    the uniform-ownership assumption and open a follow-up.
-10. Remove the `USERWORK` mass-return hook.
-11. Run verification below.
+6. Remove the `USERWORK` mass-return hook.
+7. Run verification below.
 
 ## Verification
 
@@ -315,8 +363,8 @@ all-direction wrapping.
    stencil.
 6. Check deterministic results at fixed nranks. Do not require bitwise identity across
    different nranks because P2P aggregation changes floating-point summation order.
-7. Grep particle mass-return code for `Allgatherv` and `Allreduce`; any remaining
-   collective must be in a once-per-rank phase.
+7. Grep particle mass-return code for `Allgatherv` and `Allreduce`; no collective may
+   remain inside per-MeshBlock task-list execution.
 8. Create multiple NEW particles on different MeshBlocks of the same rank and verify
    `ProcessNewParticles` assigns unique IDs after operator-split physics.
 9. Test particles near a shear-periodic corner and near a vertical disk/outflow boundary.
