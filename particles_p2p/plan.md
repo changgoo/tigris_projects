@@ -25,8 +25,9 @@ restores the concrete rev-2 implementation details needed for coding.
 
 | File | Change |
 |------|--------|
-| `src/task_list/ops_task_list.hpp` | Add task IDs and declarations for split interaction, mass-return, and refresh tasks |
-| `src/task_list/ops_task_list.cpp` | Register new dependencies and task functions before cooling |
+| `src/main.cpp` | Split operator-split execution into task-list passes with mesh-level exchange calls between passes |
+| `src/task_list/ops_task_list.hpp` | Add task IDs and declarations for per-MeshBlock split phases |
+| `src/task_list/ops_task_list.cpp` | Register per-MeshBlock phases for each operator-split pass |
 | `src/particles/particles.hpp` | Add origin arrays, tag constants, and rank exchange/mailbox declarations |
 | `src/particles/particles_bvals.cpp` | Preserve origin fields and record source rank/gid on ghost flush |
 | `src/particles/complex_particles.hpp/cpp` | Split accretion from delta exchange/apply; capture ghost origins at push time |
@@ -47,17 +48,31 @@ total returned to the particle owner. The existing post-cooling hydro/scalar bou
 communication then synchronizes the updated active zones before `CONS2PRIM`.
 
 ```text
-recvgpar
-  -> INTERACT_PRE_MR
-  -> ACCRETION_DELTA_EXCHANGE      // once per rank
-  -> ACCRETION_DELTA_APPLY         // per MeshBlock
-  -> FEEDBACK_INJECT               // per MeshBlock
-  -> MASS_RETURN_COLLECT           // once per rank
-  -> MASS_RETURN_DEPOSIT           // per MeshBlock
-  -> MASS_RETURN_COMMIT            // once per rank
+// main.cpp, once per cycle after RK stages and ray tracing:
+OperatorSplitTaskListPhase1()
+  CREATE_PAR -> SET_FBR -> SEND/RECV_GPAR[SH] -> INTERACT_PRE_MR
+
+pmesh->AccretionDeltaExchange()
+  RankExchangeManager::Exchange(PAR_DELTA_CHANNEL)
+
+OperatorSplitTaskListPhase2()
+  ACCRETION_DELTA_APPLY -> FEEDBACK_INJECT
+  -> MASS_RETURN_COLLECT_LOCAL -> MASS_RETURN_DEPOSIT_ACTIVE
+
+pmesh->MassReturnCommitExchange()
+  aggregate deposited totals from all local MeshBlocks
+  RankExchangeManager::Exchange(PAR_MR_COMMIT_CHANNEL)
+
+OperatorSplitTaskListPhase3()
+  MASS_RETURN_COMMIT_APPLY
   -> OPS_INT_COOLING
   -> existing SEND/RECV/SETB_HYD and SEND/RECV/SETB_SCLR tasks
+  -> REMOVE_PAR -> CONS2PRIM -> PHY_BVAL -> USERWORK -> CLEAR_ALLBND
 ```
+
+`TaskList::DoTaskListOneStage` executes tasks independently per MeshBlock, so rank-level
+exchange phases are not task-list tasks. They are mesh-level calls from `main.cpp`,
+matching existing patterns such as FFT gravity solves and `Particles::ProcessNewParticles`.
 
 Do not place mass return after the existing post-cooling communication to reuse that
 sync point. That would move particle mass return after cooling and would either change
@@ -74,10 +89,13 @@ return when it complicates the first PR.
 | Step | Ownership | Depends On | Action |
 |------|-----------|------------|--------|
 | `INTERACT_PRE_MR` | per MeshBlock | `recvgpar` | `Merge()` then `AccreteLocal()`; accretion writes local/ghost cells and records ghost deltas, but does not exchange/apply them |
-| `ACCRETION_DELTA_EXCHANGE` | once per rank | all local `INTERACT_PRE_MR` complete | pack ghost deltas from all local blocks; route to owner rank/gid |
-| `ACCRETION_DELTA_APPLY` | per MeshBlock | exchange complete | apply delivered deltas to active particles using existing pid/position/shear matching |
+| `AccretionDeltaExchange()` | mesh/rank-level outside task list | Phase 1 complete | pack ghost deltas from all local blocks; route to owner rank/gid |
+| `ACCRETION_DELTA_APPLY` | per MeshBlock, Phase 2 | exchange complete | apply delivered deltas to active particles using existing pid/position/shear matching |
 | `FEEDBACK_INJECT` | per MeshBlock | delta apply | current `pmf->DoFeedback(pmy_block, this)` unchanged |
-| `MASS_RETURN_*` | mixed | feedback inject | collect/deposit/commit finite-radius mass return before cooling; deposit active zones only |
+| `MASS_RETURN_COLLECT_LOCAL` | per MeshBlock, Phase 2 | feedback inject | stage eligible `r_return > 0` records for affected blocks |
+| `MASS_RETURN_DEPOSIT_ACTIVE` | per MeshBlock, Phase 2 | collect local complete | deposit active zones only and stage deposited totals |
+| `MassReturnCommitExchange()` | mesh/rank-level outside task list | Phase 2 complete | aggregate deposited totals and exchange owner-directed totals |
+| `MASS_RETURN_COMMIT_APPLY` | per MeshBlock, Phase 3 | commit exchange complete | owner blocks subtract returned totals from active particles |
 
 Apply accretion deltas before feedback so particle masses and flags are final for any
 feedback logic that inspects particle state.
@@ -156,21 +174,21 @@ not ghost storage order.
 assert `r_return < min(meshblock.nx*)`. Local return means "finite-radius return", not
 "single-MeshBlock return."
 
-For `r_return > 0`, route each returning particle to every MeshBlock whose physical
-domain can intersect the sphere of radius `r_return` around the particle, including
-same-rank MeshBlocks and remote MeshBlocks. A single particle may therefore deposit on
-one MeshBlock, several neighboring MeshBlocks, or more than the immediate neighbor
-stencil if `r_return` is large enough.
+For PR 1, route each returning particle only through the existing neighbor stencil,
+including face/edge/corner neighbors and shear-periodic neighbors represented in the
+particle boundary infrastructure. This supports finite-radius return across the local
+block and represented neighbors. General multi-hop/non-neighbor block lookup is deferred.
 
-If the first implementation only supports the existing ghost-neighbor stencil, add an
-explicit runtime assertion on the physical radius:
+Add an explicit runtime assertion on the physical radius:
 
 ```cpp
-r_return <= max_supported_exchange_distance
+if (r_return > max_supported_exchange_distance)
+  ATHENA_ERROR("r_return exceeds neighbor-stencil exchange range; "
+               "multi-hop routing is deferred");
 ```
 
 where `max_supported_exchange_distance` is derived from physical block extents and the
-actual exchange stencil. Do not express this as a raw cell-count comparison.
+actual neighbor stencil. Do not express this as a raw cell-count comparison.
 
 ## Exchange Manager Design
 
@@ -198,6 +216,10 @@ records are grouped by destination rank/gid/channel and sent once per phase. `Dr
 returns all records for `(my_gid, channel)` and clears that mailbox entry. The mailbox
 is cleared at `BeginPhase`.
 
+Parallelization assumption for PR 1: flat MPI. No OpenMP locking is required. Each
+MeshBlock can still stage outgoing records in its own vectors during per-MeshBlock
+tasks; the mesh-level exchange call merges those vectors before MPI exchange.
+
 ## Accretion Delta Return
 
 Record layout remains:
@@ -219,10 +241,10 @@ Each local MeshBlock contributes active, non-ghost particles due for return. Onl
 `pid >= 0` is eligible; `pid == NEW` or `pid == DEL` with positive return is an error or
 an explicit diagnostic skip.
 
-- `r_return > 0`: route records to every MeshBlock whose physical domain can overlap
-  the return sphere, using block geometry, neighbor/boundary metadata, and shear
-  transforms. This may include multiple MeshBlocks per particle; it is not restricted
-  to purely local cells or a single immediate neighbor.
+- `r_return > 0`: route records to every represented neighbor-stencil MeshBlock whose
+  physical domain can overlap the return sphere, using block geometry,
+  neighbor/boundary metadata, and shear transforms. Multi-hop routing beyond this
+  stencil is deferred and guarded by `max_supported_exchange_distance`.
 - `r_return == 0`: optional/deferred. If this path stays simple, gather the returning
   particle list once per rank because every rank deposits global return. If it complicates
   the rank-level task split, reject with `ATHENA_ERROR` and document a follow-up.
@@ -275,21 +297,23 @@ all-direction wrapping.
 
 ## Implementation Sequence
 
-1. Add task IDs/functions in `ops_task_list.hpp/cpp` for the split graph above.
-2. Add `RankExchangeManager` and safe tag assertions.
-3. Add/preserve origin fields and `FlushReceiveBuffer` source arguments.
-4. Split `ComplexParticles::InteractWithMesh()` into pre-MR accretion, delta exchange,
+1. Split operator-split execution in `main.cpp` into the three passes above.
+2. Add per-MeshBlock task IDs/functions in `ops_task_list.hpp/cpp` for each pass.
+3. Add `RankExchangeManager` and safe tag assertions.
+4. Add/preserve origin fields and `FlushReceiveBuffer` source arguments.
+5. Split `ComplexParticles::InteractWithMesh()` into pre-MR accretion, delta exchange,
    delta apply, and feedback injection.
-5. Convert accretion-delta return to owner-routed exchange.
-6. Split mass return into collect/deposit/commit and exclude `pid < 0`; make finite-
+6. Convert accretion-delta return to owner-routed exchange.
+7. Split mass return into collect/deposit/commit and exclude `pid < 0`; make finite-
    radius deposit active-zone-only.
-7. Implement `r_return > 0` physical-overlap routing across all affected MeshBlocks.
-8. Either implement `r_return == 0` as a once-per-rank vector reduction or add a clear
+8. Implement `r_return > 0` neighbor-stencil physical-overlap routing with a physical
+   radius guard for deferred multi-hop routing.
+9. Either implement `r_return == 0` as a once-per-rank vector reduction or add a clear
    runtime guard that defers global return.
-9. Keep non-uniform MeshBlocks/rank support if it falls out naturally; otherwise document
+10. Keep non-uniform MeshBlocks/rank support if it falls out naturally; otherwise document
    the uniform-ownership assumption and open a follow-up.
-10. Remove the `USERWORK` mass-return hook.
-11. Run verification below.
+11. Remove the `USERWORK` mass-return hook.
+12. Run verification below.
 
 ## Verification
 
@@ -299,8 +323,8 @@ all-direction wrapping.
    non-uniform case; otherwise document it as deferred.
 4. Run shear-periodic x/y with disk/outflow z boundaries.
 5. Test `r_return > 0` cases where the return sphere is contained in one MeshBlock,
-   crosses one MeshBlock boundary, crosses an edge/corner, and spans more than one
-   neighbor layer if that radius is supported.
+   crosses one MeshBlock boundary, and crosses an edge/corner within the neighbor
+   stencil.
 6. Check deterministic results at fixed nranks. Do not require bitwise identity across
    different nranks because P2P aggregation changes floating-point summation order.
 7. Grep particle mass-return code for `Allgatherv` and `Allreduce`; any remaining
@@ -310,3 +334,5 @@ all-direction wrapping.
 9. Test particles near a shear-periodic corner and near a vertical disk/outflow boundary.
 10. If `r_return == 0` is deferred, verify the runtime guard fails early with a clear
     message.
+11. Verify `r_return > max_supported_exchange_distance` fails early with a clear
+    multi-hop-routing-deferred message.
