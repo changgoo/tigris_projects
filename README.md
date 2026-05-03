@@ -11,7 +11,21 @@ Notes, plans, and documentation generated during development of
 |------|-------------|
 | `code_structure.md` | Source layout, execution flow, key physics, coding conventions |
 | `task_flow.md` | Full task-dependency graph for CRMHD + shearing-box (RK2 + ops-split) |
-| `fofc_conservation_fix.md` | FOFC conservation violation: root cause, options, and fix |
+
+---
+
+## fofc/ — First-Order Flux Correction
+
+| File | Description |
+|------|-------------|
+| `conservation_fix.md` | FOFC conservation violation: root cause, options, and fix |
+
+---
+
+## outputs/ — output format documentation
+
+| File | Description |
+|------|-------------|
 | `zprof_outputs.md` | ZprofOutput expected column definitions |
 
 ---
