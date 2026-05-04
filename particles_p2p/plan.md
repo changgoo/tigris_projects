@@ -1,5 +1,10 @@
 # P2P Ghost Return Refactor — Final Implementation Plan
 
+> Superseded: this combined implementation plan introduced too much coupling between
+> accretion-delta ordering, feedback, and mass-return grid updates. Use
+> `particles_accdelta_p2p/plan.md` and `particles_mass_return/plan.md` for current
+> planning.
+
 This plan supersedes `plan_rev3_obsolete.md`. It keeps the rev-3 architecture and
 restores the concrete rev-2 implementation details needed for coding.
 

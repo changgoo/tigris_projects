@@ -6,7 +6,7 @@ This repository is a documentation and planning companion for the private TIGRIS
 
 - `fftmpi/`: FFTGravity and fftMPI migration plans, reviews, PR text, and follow-up notes.
 - `fftmpi/plans/`: numbered exploration and design records; preserve numeric ordering.
-- `particles/` and `particles_p2p/`: particle-system context, conservation analysis, and P2P communication plans.
+- `particles/`, `particles_accdelta_p2p/`, `particles_mass_return/`, and `particles_p2p/`: particle-system context, conservation analysis, current split communication plans, and superseded combined P2P notes.
 - `fofc/`: first-order flux correction diagnostics and fixes.
 - `outputs/`: output-format notes such as z-profile column definitions.
 
@@ -17,7 +17,7 @@ Prefer one topic per Markdown file. When adding a new project area, create a dir
 There is no local build for this notes repo. Common checks are documentation-oriented:
 
 - `rg "term" .`: find existing decisions, file names, or PR references before editing.
-- `git diff -- README.md fftmpi/ particles_p2p/`: review documentation changes before committing.
+- `git diff -- README.md fftmpi/ particles_*/`: review documentation changes before committing.
 - `markdownlint '**/*.md'`: run if available to catch heading, list, and spacing issues.
 
 Implementation validation belongs in the upstream TIGRIS checkout, referenced in `code_structure.md` as `$HOME/tigris`.

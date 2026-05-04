@@ -105,27 +105,58 @@ Goal: migrate `athena_fft` from the Plimpton C backend to fftMPI, implement
 
 ---
 
-## particles_p2p/ — Refactor particle return communication
+## particles_accdelta_p2p/ — Accretion delta P2P
 
-Goal: replace per-MeshBlock collective communication in `ExchangeGhostAccretionDelta()`
-and `MassReturn::CollectParticlesInfo()` with task-flow-aware, rank-level exchanges,
-removing the O(nranks) scaling path where local communication is sufficient and
-supporting multi-MeshBlock/rank particle return paths. Non-uniform MeshBlocks/rank is a
-desirable follow-up if it does not fall out naturally.
+Goal: replace the `ExchangeGhostAccretionDelta()` collective with owner-routed
+communication while keeping `INTERACT` mostly intact. The intended split is accretion
+before the delta exchange, then feedback after received deltas have been applied.
 
 | File | Description |
 |------|-------------|
-| `context.md` | Problem background, current code analysis, existing P2P infrastructure |
-| `plan.md` | Active implementation design: task-flow hook, rank-level exchange, origin tracking, boundary-safe mass return |
-| `review.md` | First review of the original P2P plan |
-| `review_taskflow.md` | Second review focused on task flow, multi-MeshBlock/rank, and boundary compatibility |
-| `review_final.md` | Review of rev 3: five gaps identified (task flow, exchange manager, REFRESH_MR_GHOSTS, INTERACT split, r_return==0 form) |
-| `review_rev4.md` | Review of rev 4: caught task-list ownership issue and neighbor-stencil scope decisions |
-| `plan_rev2_obsolete.md` | Superseded rev-2 plan kept only for historical comparison |
-| `plan_rev3_obsolete.md` | Superseded rev-3 plan kept only for historical comparison |
+| `context.md` | Current accretion-delta collective, minimal `INTERACT` split, and feedback dependency answer |
+| `plan.md` | Implementation plan for ghost-origin tracking and `SEND/RECV_ACCDELTA` before feedback |
 
 **Related issues / PRs**
 
 | # | Title | State |
 |---|-------|-------|
 | [#269](https://github.com/PrincetonUniversity/tigris/issues/269) | Replace MPI_Allgatherv with point-to-point comm for ghost particle return data | OPEN |
+
+---
+
+## particles_mass_return/ — Mass return communication
+
+Goal: plan mass return separately from accretion deltas, with a mesh-level scheduling
+option through `Mesh::UserWorkInLoop()` or an equivalent post-operator-split hook.
+
+| File | Description |
+|------|-------------|
+| `context.md` | Mass-return communication issues, scheduling tradeoffs, and open design questions |
+| `plan.md` | Separate plan for finite-radius return, deposited-total return, and grid synchronization |
+
+**Related issues / PRs**
+
+| # | Title | State |
+|---|-------|-------|
+| [#269](https://github.com/PrincetonUniversity/tigris/issues/269) | Replace MPI_Allgatherv with point-to-point comm for ghost particle return data | OPEN |
+
+---
+
+## particles_p2p/ — Superseded combined particle return plan
+
+Historical combined plan for replacing per-MeshBlock collective communication in both
+`ExchangeGhostAccretionDelta()` and `MassReturn::CollectParticlesInfo()`. This combined
+approach introduced too much coupling between accretion-delta ordering, feedback, and
+mass-return grid updates. Use `particles_accdelta_p2p/` and `particles_mass_return/`
+for current planning.
+
+| File | Description |
+|------|-------------|
+| `context.md` | Superseded combined problem background and existing P2P infrastructure |
+| `plan.md` | Superseded combined implementation design |
+| `review.md` | First review of the original P2P plan |
+| `review_taskflow.md` | Second review focused on task flow, multi-MeshBlock/rank, and boundary compatibility |
+| `review_final.md` | Review of rev 3: five gaps identified (task flow, exchange manager, REFRESH_MR_GHOSTS, INTERACT split, r_return==0 form) |
+| `review_rev4.md` | Review of rev 4: caught task-list ownership issue and neighbor-stencil scope decisions |
+| `plan_rev2_obsolete.md` | Superseded rev-2 plan kept only for historical comparison |
+| `plan_rev3_obsolete.md` | Superseded rev-3 plan kept only for historical comparison |

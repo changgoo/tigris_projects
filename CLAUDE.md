@@ -11,9 +11,9 @@ A documentation and planning companion for [TIGRIS](https://github.com/Princeton
 Search before editing:
 
 ```bash
-rg "term" .                              # find decisions, PR numbers, function names
-git diff -- README.md fftmpi/ particles_p2p/   # review doc changes before committing
-markdownlint '**/*.md'                   # catch heading/list/spacing issues (if available)
+rg "term" .                                      # find decisions, PR numbers, function names
+git diff -- README.md fftmpi/ particles_*/       # review doc changes before committing
+markdownlint '**/*.md'                           # catch heading/list/spacing issues (if available)
 ```
 
 Key reference documents at root level:
@@ -33,7 +33,9 @@ Each folder owns a focused topic. When adding a new one, create the directory, p
 | `fftmpi/` | fftMPI migration, FFTGravity BCs, shearing remap |
 | `fftmpi/plans/` | Sequential numbered exploration/design records (preserve numeric order) |
 | `particles/` | Ghost particle boundary logic, accretion conservation |
-| `particles_p2p/` | P2P refactor replacing `MPI_Allgatherv` in ghost-return paths |
+| `particles_accdelta_p2p/` | Minimal accretion-delta P2P plan before feedback |
+| `particles_mass_return/` | Separate mass-return scheduling and communication plan |
+| `particles_p2p/` | Superseded combined P2P refactor notes |
 | `fofc/` | First-order flux correction diagnostics and boundary conservation fix |
 | `outputs/` | Output format notes (z-profile columns, etc.) |
 

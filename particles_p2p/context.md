@@ -1,5 +1,9 @@
 # P2P Ghost Return Refactor — Context
 
+> Superseded: this combined project mixed accretion-delta P2P and mass-return
+> communication. Use `particles_accdelta_p2p/` for the minimal `INTERACT` split and
+> `particles_mass_return/` for the separate mass-return project.
+
 **Issue**: [#269](https://github.com/PrincetonUniversity/tigris/issues/269)
 **Goal**: Replace `MPI_Allgatherv` in `ExchangeGhostAccretionDelta()` and
 `MassReturn::CollectParticlesInfo()` with communication that scales to multiple
@@ -10,6 +14,7 @@ MeshBlocks per rank and arbitrary boundary combinations.
 ## Problems with the current pattern
 
 Both functions follow the same three-step structure:
+
 1. Pack local data into a flat buffer
 2. `MPI_Allgather` counts + `MPI_Allgatherv` data to all ranks
 3. Scan the full received array to find particles owned by this rank
@@ -54,7 +59,7 @@ rank-wide aggregation inside those tasks.
 Called at the end of the accretion phase inside `InteractWithMesh()`. When a ghost
 particle on Block B accretes gas, it stores the delta (mass/momentum change) locally:
 
-```
+```text
 ghost_accretion_pids_      — pid of the particle (or NEW=-1)
 ghost_accretion_xp_/yp_/zp_ — position for pid=NEW disambiguation
 ghost_accretion_deltas_    — AthenaArray<Real> delta per NHYDRO+NSCALARS vars
@@ -66,7 +71,7 @@ disambiguates multiple simultaneously new particles.
 
 Buffer entry layout: `[pid, xp, yp, zp, delta[0..NHYDRO+NSCALARS-1]]`
 
-```
+```text
 entry_size = 4 + NHYDRO + NSCALARS
 ```
 
@@ -78,6 +83,7 @@ its own active (non-ghost) particles that are due to return mass. Packs via
 deposit mass within the return radius.
 
 **Two return modes controlled by `r_return`:**
+
 - `r_return > 0`: geometrically local — only blocks within `r_return` of the particle
   position are affected. P2P is valid only if routing uses the actual MeshBlock
   neighbor/boundary geometry. `r_return` is a physical radius, so this can involve one
@@ -89,9 +95,11 @@ deposit mass within the return radius.
   PR.
 
 After `ReturnMassFromParticles()` deposits mass, a second collective:
+
 ```cpp
 MPI_Allreduce(total_mass_return, npar_global, MPI_SUM, MPI_COMM_WORLD)
 ```
+
 sums up each particle's total deposited mass across ranks so the owner can subtract it
 from the particle. This reduction is globally meaningful, but the old per-MeshBlock
 call pattern is not valid for multi-MeshBlock/rank. It must be moved into the same
@@ -105,7 +113,7 @@ left unsupported for `r_return == 0` in the first implementation.
 Mass return must become coherent operator-split work, not a `USERWORK` side effect.
 The target ordering stays inside the per-MeshBlock operator-split task list:
 
-```
+```text
 INTERACT_PRE_MR
   -> SEND/RECV_ACCDELTA -> ACCRETION_DELTA_APPLY
   -> FEEDBACK_INJECT
@@ -149,23 +157,30 @@ guarded by an explicit physical-radius assertion.
 ## Existing P2P infrastructure that can be reused
 
 ### ParticleBuffer (particle_buffer.hpp)
+
 Packs/unpacks full particle data (intprop + realprop + auxprop) for MPI.
 Used for `SEND_PAR/RECV_PAR` (active migration) and `SEND_GPAR/RECV_GPAR` (ghost copy).
 
 ### SendParticleBuffer / ReceiveParticleBuffer (particles_bvals.cpp:424–490)
+
 Use `MPI_Send` (count) + `MPI_Isend` (ibuf + rbuf). Tags are computed as:
-```
+
+```text
 tag = (dest_lid<<11) | (dest_bufid<<5) | (ipar<<2)
 ```
+
 Sub-tags +1 and +2 carry the int and real payloads. So each channel uses tags T, T+1, T+2.
 
 ### Neighbor list (pbval_->neighbor[i], i < pbval_->nneighbor)
+
 Each `NeighborBlock` has:
+
 - `nb.snb.rank`, `nb.snb.gid` — remote rank and global block ID
 - `nb.bufid` — local buffer index for this neighbor (indexes send_[], recv_[], etc.)
 - `nb.targetid` — the bufid that the remote uses for me
 
 ### FlushReceiveBuffer (particles_bvals.cpp:629)
+
 Copies particle data from a received buffer into the local particle arrays.
 Currently does NOT record which neighbor the ghost came from — this is the key gap.
 
