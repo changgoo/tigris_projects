@@ -57,7 +57,8 @@ Goal: migrate `athena_fft` from the Plimpton C backend to fftMPI, implement
 | File | Description |
 |------|-------------|
 | `project_goals.md` | Project overview: goal, background, step-by-step plan |
-| `athena_fft_classes.md` | Full class documentation: FFTDriver, FFTBlock, AthenaFFTIndex, FFTGravity |
+| `athena_fft_classes.md` | FFT wrapper documentation: FFTDriver, FFTBlock, AthenaFFTIndex |
+| `fft_gravity.md` | FFTGravity and ShearingRemapper documentation |
 | `optimization_context.md` | Handoff context for the shearing-remap optimization work |
 | `shearing_remap_plan.md` | Design plan for replacing global row-exchange with MeshBlock-local remap |
 | `shearing_remap_review.md` | Review of the shearing remap refactor plan |

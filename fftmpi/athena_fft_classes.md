@@ -2,14 +2,15 @@
 
 This document describes the `athena_fft` wrapper stack: class structure, data members,
 the axis-permutation / index-mapping machinery, the cuboid multi-meshblock layout,
-and how the fftMPI C++ library is called.  It also documents `FFTGravity`, the
-multi-meshblock Poisson solver built on top of `FFTBlock`.
+and how the fftMPI C++ library is called. See
+[`fft_gravity.md`](fft_gravity.md) for the `FFTGravity` Poisson solver and
+`ShearingRemapper` integration built on top of `FFTBlock`.
 
 ---
 
 ## 1. Class Overview
 
-```
+```text
 FFTDriver                        (one per simulation; orchestrates)
   └── FFTBlock  pmy_fb           (one per MPI rank; the FFT domain)
         ├── AthenaFFTIndex  f_in_    forward FFT:  input  layout
@@ -32,7 +33,8 @@ All base classes are declared in `src/fft/athena_fft.hpp`; implemented in
 
 **File**: `src/fft/fft_driver.cpp`
 
-### Purpose
+### FFTDriver Purpose
+
 Manages the global FFT mesh layout: how MPI ranks are mapped to FFT domains, computes the
 cuboid grouping of MeshBlocks, and creates the single `FFTBlock` owned by each rank.
 
@@ -80,7 +82,8 @@ Creates the `FFTBlock` for this rank and optionally sets the normalization facto
 
 **File**: `src/fft/athena_fft.hpp` (declaration), `src/fft/athena_fft.cpp` (implementation)
 
-### Purpose
+### FFTBlock Purpose
+
 Represents the FFT domain of one MPI rank. The domain spans the union of all MeshBlocks on that
 rank (the cuboid). Owns the complex data buffers and the four `AthenaFFTIndex` objects that
 describe how data is laid out at each stage of the FFT pipeline.
@@ -128,7 +131,8 @@ decomposition in the fftMPI plan is larger than the brick (see §7).
 
 **File**: `src/fft/athena_fft.hpp` (declaration), `src/fft/athena_fft.cpp:542-653`
 
-### Purpose
+### AthenaFFTIndex Purpose
+
 Describes the data layout at one stage of the distributed FFT: which axis is "fast" (contiguous
 in memory), how axes are permuted, and what the local index range is on this MPI rank.
 
@@ -150,6 +154,7 @@ in memory), how axes are permuted, and what the local index range is on this MPI
 `AthenaFFTIndex(int dim, LogicalLocation loc, RegionSize msize, RegionSize bsize)`
 
 Initializes with the canonical (unpermuted) layout:
+
 - `Nx[0] = msize.nx1`, `np[0] = msize.nx1/bsize.nx1`, `ip[0] = loc.lx1`  (x1 = fast)
 - `Nx[1] = msize.nx2`, `np[1] = msize.nx2/bsize.nx2`, `ip[1] = loc.lx2`  (x2 = mid)
 - `Nx[2] = msize.nx3`, `np[2] = msize.nx3/bsize.nx3`, `ip[2] = loc.lx3`  (x3 = slow)
@@ -209,7 +214,7 @@ are performed by fftMPI internally.
 
 ### The four index states
 
-```
+```text
 orig_idx_            canonical layout: (x1 fast, x2 mid, x3 slow)
   │
   ├─ PermuteAxis(permute0_)
@@ -238,7 +243,7 @@ back to physical (i,j,k).
 
 ### Worked example: `yz_decomp` (x2 and x3 distributed, x1 undecomposed)
 
-```
+```text
 orig_idx_:  iloc=(0,1,2)  Nx=(N1,N2,N3)  np=(1,P2,P3)
 permute0_=0 → no change
 swap1_=true → SwapAxis(0): swap axes 1↔2 → iloc=(0,2,1)  Nx=(N1,N3,N2)  np=(1,P3,P2)
@@ -277,6 +282,7 @@ ks = loc.lx3 * bsize.nx3 - loc_.lx3 * bsize_.nx3;   // x3 offset
 `loc` and `bsize` are the current MeshBlock's location and size.
 
 Then for each cell `(mi, mj, mk)` in the MeshBlock's active zone:
+
 ```cpp
 std::int64_t idx = GetIndex(mi, mj, mk, f_in_);
 dst[idx] = {src(n, k, j, i), 0.0};
@@ -288,6 +294,7 @@ to the storage order expected by fftMPI.
 ### RetrieveResult — copying FFT output back to MeshBlock
 
 Same offset computation. For each cell:
+
 ```cpp
 std::int64_t idx = GetIndex(mi, mj, mk, b_out_);
 dst(k,j,i) = std::real(src[idx]) * norm_factor_;
@@ -334,6 +341,7 @@ Same structure using `b_in_->is/ie` as input and `b_out_` ranges as output, with
 ### Buffer sizing
 
 After `setup()`, fftMPI may require intermediate pencil sizes larger than the brick:
+
 ```cpp
 // fast_cnt, mid_cnt, slow_cnt are the pencil sizes at each stage
 int maxcnt = max({cnt_, fast_cnt, mid_cnt, slow_cnt});
@@ -358,7 +366,7 @@ void FFTBlock::Execute(AthenaFFTPlan *plan)
 
 For a 3D plan the execution is an explicit five-step pipeline:
 
-```
+```text
 in_  →  [remap_prefast?]  →  fft_fast  →  remap_fastmid  →  fft_mid
      →  remap_midslow  →  fft_slow  →  [remap_postslow?]  →  out_
 ```
@@ -383,7 +391,8 @@ FFT direction and the remap direction.  `remap_prefast` and `remap_postslow` are
 the input/output layout already matches the fast-pencil layout (identity case).
 
 For a 2D plan the chain reduces to:
-```
+
+```text
 [remap_prefast?] → fft_fast → [remap_fastslow?] → fft_slow → [remap_postslow?]
 ```
 
@@ -445,73 +454,8 @@ The main remaining differences are in decomposition scope and API exposure:
 | Index mapping | `AthenaFFTIndex` (explicit permutation objects) | Implicit in `FFT3d::setup()` ranges |
 | Plan type | `AthenaFFTPlan` wrapping `FFT3d*`/`FFT2d*` | `FFTMPI_NS::FFT3d` directly |
 | Remap stages exposed | Via `plan->pf3d->remap_*` (friend access) | Via `pf3d->remap_*` directly |
-| Gravity solver | `FFTGravity` (all 4 BCs; see §13) | `BlockFFTGravity` (all 4 BCs; 1 MB/rank) |
+| Gravity solver | `FFTGravity` (all 4 BCs; see `fft_gravity.md`) | `BlockFFTGravity` (legacy 1 MB/rank solver) |
 
-`BlockFFT` / `BlockFFTGravity` are retained for the shearing-periodic BC regression test
-(`swing.py`) and will be removed in a follow-up PR (MPIFFT.md Step 8).
-
----
-
-## 13. FFTGravity — Multi-Meshblock Poisson Solver
-
-**Files**: `src/gravity/fft_gravity.hpp`, `src/gravity/fft_gravity.cpp`
-
-### Class hierarchy
-
-```
-FFTGravityDriver : public FFTDriver   (one per simulation)
-  └── FFTGravity  : public FFTBlock   (one per MPI rank; extends FFTBlock)
-```
-
-`FFTGravity` inherits all of `FFTBlock`'s cuboid multi-meshblock machinery and overrides
-`ApplyKernel`, `ExecuteForward`, and `ExecuteBackward` to dispatch on the gravity BC.
-
-`FFTGravityDriver::Solve(stage, mode, gas_only)` handles source loading, FFT execution,
-and result retrieval for all BC modes.
-
-### Boundary conditions
-
-| BC | `gbflag` | Algorithm | Extra data |
-|----|----------|-----------|------------|
-| Periodic | `GravityBoundaryFlag::periodic` | `ApplyKernel(mode)`: discrete (mode=0) or continuous (mode=1) Poisson kernel applied to `out_`; result in `in_` | — |
-| Open | `GravityBoundaryFlag::open` | 8-parity convolution with cell-averaged Green's function `grf_` on 2× domain; 8 forward/backward FFT passes accumulate into `phi` | `grf_` (k-space GRF), `pf3dgrf_` (FFT3d for 2× domain) |
-| Disk | `GravityBoundaryFlag::disk` | Even/odd z-pencil split: xy-FFT → phase shift → z-FFT on each half → kernel → iFFT → combine → ixy-FFT; decomposition-independent via dedicated `pf3d_disk_` | `in_e_`, `in_o_` (pencil buffers), `pf3d_disk_` |
-| Shearing-periodic | (shear_periodic flag) | Global density assembly via `MPI_Allreduce`; y-roll applied in `LoadShearingSource`/`RetrieveShearingResult`; standard forward/backward FFT with shear kernel | global src/phi vectors |
-
-### Key private members of FFTGravity
-
-| Member | Meaning |
-|--------|---------|
-| `grf_` | k-space Green's function buffer for open BC (size ≥ max pencil on 2× domain) |
-| `in_e_`, `in_o_` | Even/odd z-pencil buffers for disk BC |
-| `pf3dgrf_` | `FFT3d*` for the 2× extended domain used in `InitGreen()` |
-| `pf3d_disk_` | `FFT3d*` in physical (x,y,z) brick layout for disk BC forward/backward |
-| `permute_disk_` | Fixed to 2 (z-pencil output) for `pf3d_disk_` |
-| `four_pi_G_`, `Lx3_` | Disk/open BC physical constants |
-| `qomt_` | Shear parameter `q*Omega*dt` set each timestep |
-| `slow_nx1_`, `slow_nx2_`, `slow_nx3_` | Local dimensions of the z-pencil (disk BC) |
-| `slow_ilo_`, `slow_jlo_`, `slow_klo_` | Global offsets of the z-pencil (disk BC, MPI) |
-
-### Open BC: Green's function initialization
-
-`InitGreen(four_pi_G)` (called once at construction):
-1. Creates `pf3dgrf_`: an `FFT3d` for the `2Nx1 × 2Nx2 × 2Nx3` domain with the same
-   permutation as `fplan_->pf3d` but at 2× scale.
-2. Fills `grf_` with the cell-averaged Green's function (via `_GetIGF`) on the 2× domain,
-   folded to `[-Nx, Nx-1]` range.
-3. Forward-FFTs `grf_` in place so `MultiplyGreen(px, py, pz)` can multiply directly in
-   k-space at parity offset `(2*ki+px, 2*kj+py, 2*kk+pz)`.
-
-### Disk BC: decomposition independence
-
-The standard `fplan_->pf3d` permutation depends on the MPI decomposition and may not keep
-z as the slow axis.  `pf3d_disk_` is set up independently in the physical `(x,y,z)` layout
-(`permute=2`, z-pencil output), so the even/odd z-split always operates on global z-indices
-regardless of the process grid.
-
-### Multi-meshblock support
-
-`FFTGravity` inherits `FFTBlock`'s cuboid layout, so `nmb > 1` meshblocks per rank work
-for all BC modes.  The shearing-periodic path assembles the full global density via
-`MPI_Allreduce` before calling `LoadShearingSource`, which is the standard approach for
-that BC and does not benefit from the cuboid structure.
+`BlockFFT` / `BlockFFTGravity` are retained for the legacy 1 MeshBlock/rank path and
+for shearing-periodic regression coverage. The current migration direction is to keep
+new behavior in `FFTGravity` and drop `BlockFFTGravity` in a later cleanup.
