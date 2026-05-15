@@ -143,6 +143,24 @@ option through `Mesh::UserWorkInLoop()` or an equivalent post-operator-split hoo
 
 ---
 
+## uct_hlld_refactor/ — UCT-HLLD wave speed deduplication
+
+Goal: eliminate the duplicate wave speed computation between `Hydro::CalculateHLLWaveSpeed`
+and the HLLD/lHLLD Riemann solvers when `ct_method=uct_hlld` or `uct_hll` is active.
+
+| File | Description |
+|------|-------------|
+| `design.md` | Phase 1 profiling design + Phase 2 inline refactor spec |
+| `context.md` | Code context: duplication anatomy, SIMD structure, key file/line references |
+
+**Related PRs / issues**
+
+| # | Title | State |
+|---|-------|-------|
+| — | (in progress) | — |
+
+---
+
 ## particles_p2p/ — Superseded combined particle return plan
 
 Historical combined plan for replacing per-MeshBlock collective communication in both
