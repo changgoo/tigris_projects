@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A documentation and planning companion for [TIGRIS](https://github.com/PrincetonUniversity/tigris), a private CRMHD fork of Athena++. There is no buildable source here — all Markdown files are design notes, plans, reviews, and context documents that inform changes to the upstream TIGRIS checkout at `$HOME/tigris` (branch `tigris-master`).
+A documentation and planning companion for [TIGRIS](https://github.com/PrincetonUniversity/tigris), a private CRMHD fork of Athena++. There is no buildable source here — all Markdown files are design notes, plans, reviews, and context documents that inform changes to the upstream TIGRIS checkout at `../tigris` (branch `tigris-master`).
 
 ## Navigation
 
@@ -28,17 +28,6 @@ Key reference documents at root level:
 
 Each folder owns a focused topic. When adding a new one, create the directory, put one-topic-per-file Markdown inside, and add a short table entry + related PRs to `README.md`.
 
-| Folder | Topic |
-|--------|-------|
-| `fftmpi/` | fftMPI migration, FFTGravity BCs, shearing remap |
-| `fftmpi/plans/` | Sequential numbered exploration/design records (preserve numeric order) |
-| `particles/` | Ghost particle boundary logic, accretion conservation |
-| `particles_accdelta_p2p/` | Minimal accretion-delta P2P plan before feedback |
-| `particles_mass_return/` | Separate mass-return scheduling and communication plan |
-| `particles_p2p/` | Superseded combined P2P refactor notes |
-| `fofc/` | First-order flux correction diagnostics and boundary conservation fix |
-| `outputs/` | Output format notes (z-profile columns, etc.) |
-
 ## TIGRIS source conventions (for documents that reference upstream code)
 
 - C++11, BSD 3-Clause, Athena++ style: `snake_case`, Doxygen comments
@@ -49,9 +38,35 @@ Each folder owns a focused topic. When adding a new one, create the directory, p
 
 When making technical claims about TIGRIS behavior, cite upstream file paths, function names, PR numbers, or issue numbers so the claim is auditable. Do not invent behavior — cross-check existing notes and, when in doubt, consult the upstream source.
 
+### Coding rules
+- Add concise technical comments
+- Make frequent commits when a chunk of implementation task is done; do not add claude coauthorship
+
 ## Document style
 
 - One topic per Markdown file, lowercase `snake_case` filenames
 - Sequential plans use two-digit numeric prefixes (`01_`, `02_`, …)
 - Tables for PR/issue inventories; short paragraphs for prose
 - Commits scoped to one documentation topic; subjects use short imperative or descriptive form
+
+## Software Engineering Principles
+
+### KISS (Keep It Simple, Stupid)
+* Prioritize simplicity over clever or overly complex solutions.
+* Simple code is much easier to read, debug, and maintain.
+
+### DRY (Don't Repeat Yourself)
+* Avoid duplicate code.
+* If the same logic exists in multiple places, extract it into a reusable component so that future updates only require a single change.
+
+### YAGNI (You Aren't Gonna Need It)
+* Only build features that are required right now, rather than adding hypothetical code you think you might need in the future.
+
+## Communication Protocol
+
+### Forbidden
+* No Social Fluff
+* No Apologies: Just fix it
+* No hedging: State the optimal path.
+
+
