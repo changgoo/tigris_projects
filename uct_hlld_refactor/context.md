@@ -96,6 +96,18 @@ in the HLL sense. So `CalculateHLLWaveSpeed` is not duplicating work for roe; it
 
 ---
 
+## Phase 1 profiling result
+
+Run: `--flux=hlld --ct_method=uct_hlld`, 64×32×32 grid, 16³ meshblocks, 500 cycles.
+
+```
+[UCT profile] RiemannSolver: 29.50 s  CalculateHLLWaveSpeed: 18.24 s  ratio: 61.8%
+```
+
+`CalculateHLLWaveSpeed` consumes **62%** of `RiemannSolver` wall time — far above the 5% threshold. Phase 2 is well justified.
+
+---
+
 ## Profiling instrumentation sketch (Phase 1)
 
 ```cpp
