@@ -40,7 +40,8 @@ When making technical claims about TIGRIS behavior, cite upstream file paths, fu
 
 ### Coding rules
 - Add concise technical comments
-- Make frequent commits when a chunk of implementation task is done; do not add claude coauthorship
+- **Make frequent commits** when a chunk of implementation task is done
+- do not add claude coauthorship
 
 ## Document style
 
