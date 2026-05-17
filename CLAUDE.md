@@ -1,20 +1,13 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## What this repo is
 
-A documentation and planning companion for [TIGRIS](https://github.com/PrincetonUniversity/tigris), a private CRMHD fork of Athena++. There is no buildable source here — all Markdown files are design notes, plans, reviews, and context documents that inform changes to the upstream TIGRIS checkout at `../tigris` (branch `tigris-master`).
+A documentation and planning companion for [TIGRIS](https://github.com/PrincetonUniversity/tigris), a private CRMHD fork of Athena++.
+There is no buildable source in this repo — all Markdown files are design notes, plans, reviews,
+and context documents that inform changes to the upstream TIGRIS checkout at `../tigris` (branch `tigris-master`).
+But, worktree will be placed in each folder for on-going development.
 
 ## Navigation
-
-Search before editing:
-
-```bash
-rg "term" .                                      # find decisions, PR numbers, function names
-git diff -- README.md fftmpi/ particles_*/       # review doc changes before committing
-markdownlint '**/*.md'                           # catch heading/list/spacing issues (if available)
-```
 
 Key reference documents at root level:
 
@@ -28,6 +21,9 @@ Key reference documents at root level:
 
 Each folder owns a focused topic. When adding a new one, create the directory, put one-topic-per-file Markdown inside, and add a short table entry + related PRs to `README.md`.
 
+- Create worktree on each project folder
+- Create branch for each project
+
 ## TIGRIS source conventions (for documents that reference upstream code)
 
 - C++11, BSD 3-Clause, Athena++ style: `snake_case`, Doxygen comments
@@ -39,9 +35,11 @@ Each folder owns a focused topic. When adding a new one, create the directory, p
 When making technical claims about TIGRIS behavior, cite upstream file paths, function names, PR numbers, or issue numbers so the claim is auditable. Do not invent behavior — cross-check existing notes and, when in doubt, consult the upstream source.
 
 ### Coding rules
+
 - Add concise technical comments
 - **Make frequent commits** when a chunk of implementation task is done
 - do not add claude coauthorship
+- Run style check before open a PR
 
 ## Document style
 
